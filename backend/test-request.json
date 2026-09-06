@@ -1,0 +1,15 @@
+{
+  "userTrajectory": [
+    {"lat": 31.2300, "lng": 121.4700, "timestamp": 1700000000000, "time": "08:00"},
+    {"lat": 31.2310, "lng": 121.4710, "timestamp": 1700000600000, "time": "08:10"},
+    {"lat": 31.2320, "lng": 121.4720, "timestamp": 1700001200000, "time": "08:20"}
+  ],
+  "referenceTrajectory": [
+    {"lat": 31.2400, "lng": 121.4800, "timestamp": 1700000000000, "time": "08:00"},
+    {"lat": 31.2410, "lng": 121.4810, "timestamp": 1700000600000, "time": "08:10"},
+    {"lat": 31.2420, "lng": 121.4820, "timestamp": 1700001200000, "time": "08:20"}
+  ],
+  "thresholdK": 3,
+  "timeAnomaly": false,
+  "anomalyDesc": null
+}
