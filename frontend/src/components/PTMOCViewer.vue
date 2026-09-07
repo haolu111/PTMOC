@@ -73,8 +73,8 @@
               <option :value="5">5</option>
             </select>
           </div>
-          <button class="plan-btn" :disabled="isTraveling" @click="onPlanRoute">
-            规划路线
+          <button class="plan-btn" :disabled="isTraveling || planningLoading" @click="onPlanRoute">
+            {{ planningLoading ? '规划中...' : '规划路线' }}
           </button>
         </div>
 
@@ -96,16 +96,27 @@
         </div>
       </div>
 
-      <div class="map-full">
-        <div class="map-title">
-          地图
-          <span class="map-legend">
-            <span class="legend-dot legend-start"></span>起点
-            <span class="legend-dot legend-end"></span>终点
-            <span class="legend-line legend-ref"></span>参考轨迹（演示）
-          </span>
+      <div class="main-workspace">
+        <div class="map-full">
+          <div class="map-title">
+            地图
+            <span class="map-legend">
+              <span class="legend-dot legend-start"></span>起点
+              <span class="legend-dot legend-end"></span>终点
+              <span class="legend-line legend-ref"></span>参考路线
+              <span class="legend-line legend-alt"></span>备选路线
+            </span>
+          </div>
+          <div class="map-container" ref="mapRef"></div>
         </div>
-        <div class="map-container" ref="mapRef"></div>
+        <aside class="route-side" v-if="plannedRoutes.length || planningLoading">
+          <div v-if="planningLoading" class="route-loading">正在规划三条可选路线...</div>
+          <RoutePlanList
+            :routes="plannedRoutes"
+            :selected-id="selectedRouteId"
+            @select="onSelectPlannedRoute"
+          />
+        </aside>
       </div>
     </div>
 
@@ -280,8 +291,9 @@ import 'leaflet/dist/leaflet.css'
 import { getEndPointsForStart, getRouteByStartEnd } from '../data/trajectoryData.js'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { verifyTrajectory, buildCryptoViewModel } from '../api/ptmocApi.js'
-import { emptyLocation, isLocationSelected } from '../api/mapApi.js'
+import { emptyLocation, isLocationSelected, planRoutes } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
+import RoutePlanList from './map/RoutePlanList.vue'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -530,6 +542,10 @@ const startLocation = ref(emptyLocation())
 const endLocation = ref(emptyLocation())
 const planHint = ref('')
 const planHintType = ref('info') // info | ok | warn
+const plannedRoutes = ref([])
+const selectedRouteId = ref('')
+const selectedPlannedRoute = ref(null)
+const planningLoading = ref(false)
 
 const endPoints = computed(() => getEndPointsForStart('人民广场'))
 const canStart = computed(() => selectedEnd.value && currentTrajectory.value)
@@ -541,22 +557,33 @@ let mainMap = null
 let travelMap = null
 let startMarker = null
 let endMarker = null
+let plannedPolylines = []
 
 function clearEndpointMarkers() {
   if (startMarker) { mainMap?.removeLayer(startMarker); startMarker = null }
   if (endMarker) { mainMap?.removeLayer(endMarker); endMarker = null }
 }
 
+function clearPlannedPolylines() {
+  plannedPolylines.forEach(l => { try { mainMap?.removeLayer(l) } catch (_) {} })
+  plannedPolylines = []
+}
+
+function clearMainOverlays() {
+  if (!mainMap) return
+  mainMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) mainMap.removeLayer(l) })
+  startMarker = null
+  endMarker = null
+  plannedPolylines = []
+}
+
 function refreshEndpointMarkers() {
   if (!mainMap) return
-
-  // 若当前展示预设轨迹，由 updateMainMap 负责；此处只画自由选点
   if (currentTrajectory.value) return
 
   clearEndpointMarkers()
   const boundsPts = []
 
-  // 高德 Web 服务坐标为 GCJ-02，直接用于高德瓦片，不再做 WGS84 转换
   if (isLocationSelected(startLocation.value)) {
     const lat = startLocation.value.lat
     const lng = startLocation.value.lng
@@ -574,40 +601,111 @@ function refreshEndpointMarkers() {
     boundsPts.push([lat, lng])
   }
 
-  if (boundsPts.length === 1) {
-    mainMap.setView(boundsPts[0], 14)
-  } else if (boundsPts.length === 2) {
-    mainMap.fitBounds(L.latLngBounds(boundsPts), { padding: [60, 60] })
+  if (!plannedRoutes.value.length) {
+    if (boundsPts.length === 1) mainMap.setView(boundsPts[0], 14)
+    else if (boundsPts.length === 2) mainMap.fitBounds(L.latLngBounds(boundsPts), { padding: [60, 60] })
   }
 }
 
-function onPlanRoute() {
+function drawPlannedRoutes() {
+  if (!mainMap) return
+  clearPlannedPolylines()
+
+  const allLatLngs = []
+  plannedRoutes.value.forEach((route) => {
+    const latlngs = (route.polyline || []).map(p => [p.lat, p.lng])
+    if (!latlngs.length) return
+    const selected = route.routeId === selectedRouteId.value
+    const line = L.polyline(latlngs, {
+      color: selected ? '#1890ff' : '#8c8c8c',
+      weight: selected ? 6 : 3,
+      opacity: selected ? 0.95 : 0.45,
+      dashArray: selected ? null : '6, 8'
+    }).addTo(mainMap)
+    line.bindPopup(`${route.name} · ${(route.distanceMeters / 1000).toFixed(1)} km`)
+    plannedPolylines.push(line)
+    latlngs.forEach(ll => allLatLngs.push(ll))
+  })
+
+  refreshEndpointMarkers()
+
+  if (allLatLngs.length) {
+    mainMap.fitBounds(L.latLngBounds(allLatLngs), { padding: [50, 50] })
+  }
+}
+
+function onSelectPlannedRoute(route) {
+  selectedRouteId.value = route.routeId
+  selectedPlannedRoute.value = route
+  planHintType.value = 'ok'
+  planHint.value = `已选择参考路线：${route.name}（${(route.distanceMeters / 1000).toFixed(1)} km / ${Math.round(route.durationSeconds / 60)} min）`
+  drawPlannedRoutes()
+}
+
+async function onPlanRoute() {
   if (!isLocationSelected(startLocation.value) || !isLocationSelected(endLocation.value)) {
     planHintType.value = 'warn'
     planHint.value = '请从候选列表中分别选择具体的起点和终点（仅输入文字不能规划）'
     showAlert('warning', '请从下拉候选中选择具体 POI，不能只输入文字。')
     return
   }
-  // 清除演示路线，避免和自由选点混用
+
   selectedEnd.value = ''
   currentTrajectory.value = null
-  if (mainMap) {
-    mainMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) mainMap.removeLayer(l) })
-  }
-  startMarker = null
-  endMarker = null
+  plannedRoutes.value = []
+  selectedRouteId.value = ''
+  selectedPlannedRoute.value = null
+  clearMainOverlays()
   refreshEndpointMarkers()
-  planHintType.value = 'ok'
-  planHint.value = `起终点已确认：${startLocation.value.name} → ${endLocation.value.name}（经纬度已取得）。动态道路规划将在目标2接入。`
+
+  planningLoading.value = true
+  planHintType.value = 'info'
+  planHint.value = '正在规划：推荐路线 / 躲避拥堵 / 速度最快 ...'
+
+  try {
+    const routes = await planRoutes(
+      { lng: startLocation.value.lng, lat: startLocation.value.lat },
+      { lng: endLocation.value.lng, lat: endLocation.value.lat }
+    )
+    plannedRoutes.value = routes
+    if (!routes.length) {
+      planHintType.value = 'warn'
+      planHint.value = '未返回可用路线，请换一组起终点重试'
+      return
+    }
+    // 默认选中第一条（推荐路线）
+    onSelectPlannedRoute(routes[0])
+    planHintType.value = 'ok'
+    planHint.value = `已规划 ${routes.length} 条路线，默认选中「${routes[0].name}」作为参考路线`
+  } catch (err) {
+    planHintType.value = 'warn'
+    planHint.value = err?.message || '路径规划失败'
+    showAlert('warning', err?.message || '路径规划失败，请检查后端与高德 Key')
+  } finally {
+    planningLoading.value = false
+  }
 }
 
 watch(startLocation, () => {
+  // 起终点变更后清空旧路线，避免错配
+  if (plannedRoutes.value.length) {
+    plannedRoutes.value = []
+    selectedRouteId.value = ''
+    selectedPlannedRoute.value = null
+    clearPlannedPolylines()
+  }
   if (!currentTrajectory.value) {
     nextTick(() => refreshEndpointMarkers())
   }
 }, { deep: true })
 
 watch(endLocation, () => {
+  if (plannedRoutes.value.length) {
+    plannedRoutes.value = []
+    selectedRouteId.value = ''
+    selectedPlannedRoute.value = null
+    clearPlannedPolylines()
+  }
   if (!currentTrajectory.value) {
     nextTick(() => refreshEndpointMarkers())
   }
@@ -617,9 +715,17 @@ function onEndChange() {
   if (!selectedEnd.value) {
     currentTrajectory.value = null
     planHint.value = ''
-    nextTick(() => refreshEndpointMarkers())
+    nextTick(() => {
+      clearMainOverlays()
+      refreshEndpointMarkers()
+      if (plannedRoutes.value.length) drawPlannedRoutes()
+    })
     return
   }
+  // 使用演示路线时清空动态规划结果
+  plannedRoutes.value = []
+  selectedRouteId.value = ''
+  selectedPlannedRoute.value = null
   const data = getRouteByStartEnd('人民广场', selectedEnd.value)
   if (data) {
     currentTrajectory.value = data
@@ -632,9 +738,7 @@ function onEndChange() {
 function updateMainMap() {
   if (!mainMap || !currentTrajectory.value) return
   mainMap.invalidateSize()
-  mainMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) mainMap.removeLayer(l) })
-  startMarker = null
-  endMarker = null
+  clearMainOverlays()
 
   const refPts = convertPts(currentTrajectory.value.referenceTrajectory)
   const refLatLngs = refPts.map(p => [p.lat, p.lng])
@@ -654,6 +758,7 @@ function initMainMap() {
       if (mainMap) {
         mainMap.invalidateSize()
         if (currentTrajectory.value) updateMainMap()
+        else if (plannedRoutes.value.length) drawPlannedRoutes()
         else refreshEndpointMarkers()
       }
     }, 200)
@@ -1387,6 +1492,36 @@ watch(currentPage, (val) => {
 }
 .legend-dot.legend-start { background: #52c41a; }
 .legend-dot.legend-end { background: #ff4d4f; }
+.legend-line.legend-alt {
+  background: #8c8c8c;
+  opacity: 0.7;
+}
+.main-workspace {
+  display: flex;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  padding: 12px 16px 16px;
+  box-sizing: border-box;
+}
+.main-workspace .map-full {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+.route-side {
+  width: 300px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+.route-loading {
+  font-size: 13px;
+  color: #1677ff;
+  margin-bottom: 8px;
+}
 .form-row { display: flex; flex-direction: column; gap: 2px; }
 .form-row label { font-size: 11px; color: #999; font-weight: 500; }
 .form-row select {

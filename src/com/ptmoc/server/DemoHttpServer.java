@@ -44,6 +44,7 @@ public class DemoHttpServer {
         server.createContext("/api/ptmoc/verify", new VerifyHandler());
         server.createContext("/api/map/health", new MapHealthHandler());
         server.createContext("/api/map/tips", new MapTipsHandler());
+        server.createContext("/api/map/routes", new MapRoutesHandler());
         server.createContext("/", new RootHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
@@ -53,6 +54,7 @@ public class DemoHttpServer {
         System.out.println("  POST /api/ptmoc/verify");
         System.out.println("  GET  /api/map/health");
         System.out.println("  GET  /api/map/tips");
+        System.out.println("  POST /api/map/routes");
         System.out.println("Amap configured: " + AMAP.isConfigured());
         System.out.println("Uses real PTMOC core: Setup → KeyGen → Encode → Encrypt → Eval → Decrypt");
     }
@@ -186,6 +188,54 @@ public class DemoHttpServer {
                 String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 writeJson(exchange, 500, error("地图服务暂时不可用（" + msg + "）"));
             }
+        }
+    }
+
+    static class MapRoutesHandler implements HttpHandler {
+        public void handle(HttpExchange exchange) throws IOException {
+            if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+                addCors(exchange.getResponseHeaders());
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                writeJson(exchange, 405, error("Method Not Allowed"));
+                return;
+            }
+            try {
+                String json = readBody(exchange);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> body = GSON.fromJson(json, Map.class);
+                if (body == null) {
+                    writeJson(exchange, 400, error("请求体不能为空"));
+                    return;
+                }
+                Map<?, ?> origin = (Map<?, ?>) body.get("origin");
+                Map<?, ?> destination = (Map<?, ?>) body.get("destination");
+                if (origin == null || destination == null) {
+                    writeJson(exchange, 400, error("origin 和 destination 不能为空"));
+                    return;
+                }
+                double oLng = toDouble(origin.get("lng"));
+                double oLat = toDouble(origin.get("lat"));
+                double dLng = toDouble(destination.get("lng"));
+                double dLat = toDouble(destination.get("lat"));
+                Map<String, Object> response = AMAP.planDrivingRoutes(oLng, oLat, dLng, dLat);
+                writeJson(exchange, 200, response);
+            } catch (IllegalStateException e) {
+                writeJson(exchange, 400, error(e.getMessage()));
+            } catch (Exception e) {
+                e.printStackTrace();
+                String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                writeJson(exchange, 500, error("路径规划暂时不可用（" + msg + "）"));
+            }
+        }
+
+        private static double toDouble(Object v) {
+            if (v == null) return 0;
+            if (v instanceof Number) return ((Number) v).doubleValue();
+            return Double.parseDouble(String.valueOf(v));
         }
     }
 

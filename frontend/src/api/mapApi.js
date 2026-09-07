@@ -58,3 +58,34 @@ export function emptyLocation() {
 export function isLocationSelected(loc) {
   return !!(loc && loc.name && loc.lng != null && loc.lat != null && Number.isFinite(loc.lng) && Number.isFinite(loc.lat))
 }
+
+/**
+ * 路径规划：返回推荐路线 / 躲避拥堵 / 速度最快 三条路线
+ * @param {{lng:number,lat:number}} origin
+ * @param {{lng:number,lat:number}} destination
+ */
+export async function planRoutes(origin, destination, timeoutMs = 20000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(apiUrl('/api/map/routes'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        origin: { lng: origin.lng, lat: origin.lat },
+        destination: { lng: destination.lng, lat: destination.lat }
+      }),
+      signal: controller.signal
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      throw new Error(data.error || `路径规划失败 (${res.status})`)
+    }
+    if (!data || !Array.isArray(data.routes)) {
+      throw new Error(data.error || '路径规划返回格式异常')
+    }
+    return data.routes
+  } finally {
+    clearTimeout(timer)
+  }
+}
