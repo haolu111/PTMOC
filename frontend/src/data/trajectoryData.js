@@ -3321,7 +3321,7 @@ function generateTimestamps(numPoints, baseTime, durationMinutes) {
   const timestamps = [];
   const intervalMs = (durationMinutes * 60 * 1000) / (numPoints - 1);
   for (let i = 0; i < numPoints; i++) {
-    timestamps.push(baseTime + i * intervalMs);
+    timestamps.push(Math.round(baseTime + i * intervalMs));
   }
   return timestamps;
 }

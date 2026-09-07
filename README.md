@@ -211,6 +211,20 @@ npm run dev
 
 ### 2. 后端启动
 
+**方式 A（推荐，当前 Mac/JDK8 可用）：**
+
+```bash
+cd PTMOC_code
+./run-backend.sh
+```
+
+该脚本会编译真实 PTMOC 核心并启动 JDK8 Demo HTTP 服务（`http://localhost:8080`），接口与 Spring Boot 一致：
+
+- `GET /api/ptmoc/health`
+- `POST /api/ptmoc/verify`
+
+**方式 B（Spring Boot，需要 JDK 17+）：**
+
 ```bash
 cd PTMOC/backend
 mvn clean package -DskipTests
@@ -218,6 +232,8 @@ java -jar target/ptmoc-backend-1.0.0.jar
 ```
 
 后端启动后监听 `http://localhost:8080`，提供 REST API 接口。
+
+前端开发服务器已配置 `/api` 代理到 `8080`；若后端未启动，右侧面板会自动回退到离线 `CRYPTO_DATA` 演示。
 
 ### 3. 使用一键脚本 (Windows)
 
@@ -535,7 +551,7 @@ mvn clean package -DskipTests
 在主页的阈值输入框中直接修改。k 值范围为 1-3，代表需要 k 方协作才能解密的门限值。
 
 ### Q: 后端如何连接前端？
-前端默认使用模拟数据。如需连接后端，修改 `PTMOCViewer.vue` 中的 API 请求地址为后端 URL（默认 `http://localhost:8080`）。
+前端优先请求 `/api/ptmoc/verify`（Vite 代理到 `localhost:8080`）。先运行 `./run-backend.sh` 或 Spring Boot 后端；若后端不可用，自动使用预置 `CRYPTO_DATA` 离线兜底。
 
 ### Q: 调试页面怎么访问？
 调试页面入口已在登录页隐藏。开发者可在 `PTMOCViewer.vue` 中取消注释调试入口链接，或在浏览器控制台执行 `currentPage='debug'`。

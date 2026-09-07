@@ -94,8 +94,13 @@ public class PtmocService {
             // 保存密码学结果
             Map<String, Object> cr = new LinkedHashMap<>();
             cr.put("encodedMessages", messages.toString());
+            cr.put("x1", messages.get(1).toString());
+            cr.put("x2", messages.get(2).toString());
+            cr.put("x3", messages.get(3).toString());
+            cr.put("x4", messages.get(4).toString());
             cr.put("functionDefinition", functionDef);
             cr.put("decryptedResult", decryptedResult.toString());
+            cr.put("thresholdK", k);
             cryptoResult = cr;
 
         } catch (Exception e) {

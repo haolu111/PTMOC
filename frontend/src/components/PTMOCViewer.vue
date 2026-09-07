@@ -141,11 +141,15 @@
           <!-- PTMOC加密验证过程 -->
           <div class="crypto-section" v-if="showCryptoProcess">
             <h4>PTMOC 加密验证过程</h4>
+            <div class="crypto-mode-badge" :class="cryptoMode">
+              {{ cryptoMode === 'online' ? '真实后端' : cryptoMode === 'loading' ? '正在调用后端...' : '离线演示兜底' }}
+            </div>
             <div class="crypto-key-display">
-              <span class="key-label">共享密钥</span>
+              <span class="key-label">执行摘要</span>
               <span class="key-value">{{ cryptoKey }}</span>
             </div>
             <div class="crypto-content">
+              <div v-if="cryptoMode === 'loading'" class="crypto-loading">正在执行真实 PTMOC Setup → Decrypt...</div>
               <div class="crypto-step" v-for="(step, i) in cryptoSteps" :key="i">
                 <div class="crypto-step-header">
                   <span class="crypto-step-idx">{{ i + 1 }}</span>
@@ -162,12 +166,15 @@
                 </div>
               </div>
 
-              <!-- 解密结果 -->
+              <!-- 解密/验证结果 -->
               <div class="crypto-result" v-if="cryptoResult !== null">
-                <div class="crypto-result-label">解密结果</div>
+                <div class="crypto-result-label">验证结果</div>
                 <div class="crypto-result-value" :class="cryptoResult === 1 ? 'pass' : 'fail'">
-                  {{ cryptoResult }}
-                  <span class="result-text">({{ cryptoResult === 1 ? '通过' : '不通过' }})</span>
+                  {{ cryptoVerificationStatus || (cryptoResult === 1 ? '通过' : '不通过') }}
+                  <span class="result-text" v-if="cryptoScore !== null">Score: {{ cryptoScore }}</span>
+                </div>
+                <div class="crypto-decrypt-line" v-if="cryptoDecryptedResult">
+                  密文评估解密值: {{ cryptoDecryptedResult }}
                 </div>
               </div>
 
@@ -266,6 +273,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { getEndPointsForStart, getRouteByStartEnd } from '../data/trajectoryData.js'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
+import { verifyTrajectory, buildCryptoViewModel } from '../api/ptmocApi.js'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -563,6 +571,10 @@ const cryptoSteps = ref([])
 const cryptoResult = ref(null)
 const cryptoTotalTime = ref('')
 const cryptoKey = ref('')
+const cryptoMode = ref('offline') // online | offline | loading
+const cryptoScore = ref(null)
+const cryptoVerificationStatus = ref('')
+const cryptoDecryptedResult = ref('')
 
 let travelTimerInterval = null
 let pathAnimTimeout = null
@@ -732,6 +744,11 @@ function startTravel() {
   cryptoSteps.value = []
   cryptoResult.value = null
   cryptoTotalTime.value = ''
+  cryptoKey.value = ''
+  cryptoMode.value = 'offline'
+  cryptoScore.value = null
+  cryptoVerificationStatus.value = ''
+  cryptoDecryptedResult.value = ''
   currentUserLatLngs = []
   travelAlertFired = false
   userPolyline = null
@@ -1014,18 +1031,17 @@ function startPathAnimation() {
   pathAnimTimeout = requestAnimationFrame(animFrame)
 }
 
-// ========== PTMOC加密验证动画 ==========
-function animateCryptoProcess() {
-  const isPass = currentTrajectory.value?.category === 'pass'
-  const dataSource = isPass ? CRYPTO_DATA : CRYPTO_DATA_ABNORMAL
-  const finalResult = isPass ? 1 : 0
+// ========== PTMOC加密验证动画（优先真实后端，失败则离线兜底） ==========
+function playCryptoViewModel(viewModel) {
+  cryptoMode.value = viewModel.mode
+  cryptoKey.value = viewModel.key
+  cryptoScore.value = viewModel.score
+  cryptoVerificationStatus.value = viewModel.verificationStatus
+  cryptoDecryptedResult.value = viewModel.decryptedResult
+    ? String(viewModel.decryptedResult)
+    : ''
 
-  cryptoKey.value = dataSource.key
-
-  // 设置解密结果
-  dataSource.steps[5].data[2].value = finalResult.toString()
-
-  cryptoSteps.value = dataSource.steps.map(s => ({
+  cryptoSteps.value = viewModel.steps.map((s) => ({
     name: s.name,
     data: null,
     done: false
@@ -1033,16 +1049,67 @@ function animateCryptoProcess() {
 
   let stepIdx = 0
   const stepInterval = setInterval(() => {
-    if (stepIdx >= dataSource.steps.length) {
+    if (stepIdx >= viewModel.steps.length) {
       clearInterval(stepInterval)
-      cryptoResult.value = finalResult
-      cryptoTotalTime.value = dataSource.totalDuration.toString()
+      cryptoResult.value = viewModel.finalResult
+      cryptoTotalTime.value = String(viewModel.totalDuration ?? '')
       return
     }
     cryptoSteps.value[stepIdx].done = true
-    cryptoSteps.value[stepIdx].data = dataSource.steps[stepIdx].data
+    cryptoSteps.value[stepIdx].data = viewModel.steps[stepIdx].data
     stepIdx++
   }, 600)
+}
+
+function buildOfflineViewModel() {
+  const isPass = currentTrajectory.value?.category === 'pass'
+  const dataSource = isPass ? CRYPTO_DATA : CRYPTO_DATA_ABNORMAL
+  const finalResult = isPass ? 1 : 0
+  dataSource.steps[5].data[2].value = finalResult.toString()
+
+  return {
+    mode: 'offline',
+    key: `${dataSource.key} · 离线演示`,
+    steps: dataSource.steps.map((s) => ({ name: s.name, data: s.data })),
+    finalResult,
+    verificationStatus: isPass ? '通过' : '不通过',
+    score: isPass ? 100 : 40,
+    totalDuration: dataSource.totalDuration,
+    decryptedResult: String(finalResult)
+  }
+}
+
+async function animateCryptoProcess() {
+  const traj = currentTrajectory.value
+  if (!traj) {
+    playCryptoViewModel(buildOfflineViewModel())
+    return
+  }
+
+  cryptoMode.value = 'loading'
+  cryptoKey.value = '请求 /api/ptmoc/verify ...'
+  cryptoSteps.value = []
+  cryptoResult.value = null
+  cryptoTotalTime.value = ''
+  cryptoScore.value = null
+  cryptoVerificationStatus.value = ''
+  cryptoDecryptedResult.value = ''
+
+  try {
+    const response = await verifyTrajectory({
+      userTrajectory: traj.userTrajectory,
+      referenceTrajectory: traj.referenceTrajectory,
+      thresholdK: thresholdK.value,
+      timeAnomaly: !!traj.timeAnomaly,
+      anomalyDesc: traj.anomalyDesc || null
+    })
+    playCryptoViewModel(buildCryptoViewModel(response))
+  } catch (err) {
+    console.warn('[PTMOC] backend unavailable, using offline CRYPTO_DATA:', err)
+    const offline = buildOfflineViewModel()
+    offline.key = `离线兜底（后端不可用: ${err?.message || err}）`
+    playCryptoViewModel(offline)
+  }
 }
 
 // ========== 返回主页 ==========
@@ -1309,6 +1376,40 @@ watch(currentPage, (val) => {
   border-radius: 8px;
   padding: 14px;
   border: 1px solid #f0f0f0;
+}
+.crypto-mode-badge {
+  display: inline-block;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+.crypto-mode-badge.online {
+  background: #f6ffed;
+  color: #389e0d;
+  border: 1px solid #b7eb8f;
+}
+.crypto-mode-badge.offline {
+  background: #fff7e6;
+  color: #d46b08;
+  border: 1px solid #ffd591;
+}
+.crypto-mode-badge.loading {
+  background: #e6f4ff;
+  color: #1677ff;
+  border: 1px solid #91caff;
+}
+.crypto-loading {
+  font-size: 13px;
+  color: #1677ff;
+  margin-bottom: 4px;
+}
+.crypto-decrypt-line {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #666;
+  word-break: break-all;
 }
 .crypto-section h4 {
   font-size: 14px;
