@@ -156,52 +156,16 @@
             <div class="timer-hint">1秒 = 1分钟</div>
           </div>
 
-          <!-- PTMOC加密验证过程 -->
+          <!-- PTMOC 密码数据流可视化（由 processTrace 驱动） -->
           <div class="crypto-section" v-if="showCryptoProcess">
-            <h4>PTMOC 加密验证过程</h4>
-            <div class="crypto-mode-badge" :class="cryptoMode">
-              {{ cryptoMode === 'online' ? '真实后端' : cryptoMode === 'loading' ? '正在调用后端...' : '离线演示兜底' }}
-            </div>
-            <div class="crypto-key-display">
-              <span class="key-label">执行摘要</span>
-              <span class="key-value">{{ cryptoKey }}</span>
-            </div>
-            <div class="crypto-content">
-              <div v-if="cryptoMode === 'loading'" class="crypto-loading">正在执行真实 PTMOC Setup → Decrypt...</div>
-              <div class="crypto-step" v-for="(step, i) in cryptoSteps" :key="i">
-                <div class="crypto-step-header">
-                  <span class="crypto-step-idx">{{ i + 1 }}</span>
-                  <span class="crypto-step-name">{{ step.name }}</span>
-                  <span class="crypto-step-status" :class="step.done ? 'done' : ''">
-                    {{ step.done ? '✓' : '...' }}
-                  </span>
-                </div>
-                <div class="crypto-step-detail" v-if="step.done && step.data">
-                  <div class="crypto-data-row" v-for="(d, j) in step.data" :key="j">
-                    <span class="data-label">{{ d.label }}:</span>
-                    <span class="data-value">{{ d.value }}</span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 解密/验证结果 -->
-              <div class="crypto-result" v-if="cryptoResult !== null">
-                <div class="crypto-result-label">验证结果</div>
-                <div class="crypto-result-value" :class="cryptoResult === 1 ? 'pass' : 'fail'">
-                  {{ cryptoVerificationStatus || (cryptoResult === 1 ? '通过' : '不通过') }}
-                  <span class="result-text" v-if="cryptoScore !== null">Score: {{ cryptoScore }}</span>
-                </div>
-                <div class="crypto-decrypt-line" v-if="cryptoDecryptedResult">
-                  密文评估解密值: {{ cryptoDecryptedResult }}
-                </div>
-              </div>
-
-              <!-- 总耗时 -->
-              <div class="crypto-total-time" v-if="cryptoTotalTime">
-                <span class="total-label">总耗时</span>
-                <span class="total-value">{{ cryptoTotalTime }}ms</span>
-              </div>
-            </div>
+            <CryptoFlowPanel
+              :mode="cryptoMode"
+              :summary="cryptoKey"
+              :process-trace="cryptoProcessTrace"
+              :total-duration="cryptoTotalTime"
+              :auto-play="cryptoMode !== 'loading'"
+              @complete="onCryptoFlowComplete"
+            />
           </div>
         </div>
       </div>
@@ -291,10 +255,11 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { buildScenarioTrajectory, scenarioOptions } from '../data/trajectoryScenario.js'
-import { verifyTrajectory, buildCryptoViewModel } from '../api/ptmocApi.js'
+import { verifyTrajectory, buildCryptoViewModel, buildSyntheticProcessTrace } from '../api/ptmocApi.js'
 import { emptyLocation, isLocationSelected, planRoutes } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
 import RoutePlanList from './map/RoutePlanList.vue'
+import CryptoFlowPanel from './crypto/CryptoFlowPanel.vue'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -773,6 +738,7 @@ function initMainMap() {
 const travelTimer = ref(0) // 模拟分钟数（1真实秒=1模拟分钟）
 const showCryptoProcess = ref(false)
 const cryptoSteps = ref([])
+const cryptoProcessTrace = ref([])
 const cryptoResult = ref(null)
 const cryptoTotalTime = ref('')
 const cryptoKey = ref('')
@@ -974,6 +940,7 @@ function startTravel() {
   travelTimer.value = 0
   showCryptoProcess.value = false
   cryptoSteps.value = []
+  cryptoProcessTrace.value = []
   cryptoResult.value = null
   cryptoTotalTime.value = ''
   cryptoKey.value = ''
@@ -1177,7 +1144,7 @@ function startPathAnimation() {
   pathAnimTimeout = requestAnimationFrame(animFrame)
 }
 
-// ========== PTMOC加密验证动画（优先真实后端，失败则离线兜底） ==========
+// ========== PTMOC 密码流程可视化（processTrace 重放） ==========
 function playCryptoViewModel(viewModel) {
   cryptoMode.value = viewModel.mode
   cryptoKey.value = viewModel.key
@@ -1186,25 +1153,18 @@ function playCryptoViewModel(viewModel) {
   cryptoDecryptedResult.value = viewModel.decryptedResult
     ? String(viewModel.decryptedResult)
     : ''
-
-  cryptoSteps.value = viewModel.steps.map((s) => ({
+  cryptoProcessTrace.value = Array.isArray(viewModel.processTrace) ? viewModel.processTrace : []
+  cryptoSteps.value = (viewModel.steps || []).map((s) => ({
     name: s.name,
-    data: null,
-    done: false
+    data: s.data,
+    done: true
   }))
+  cryptoResult.value = viewModel.finalResult
+  cryptoTotalTime.value = String(viewModel.totalDuration ?? '')
+}
 
-  let stepIdx = 0
-  const stepInterval = setInterval(() => {
-    if (stepIdx >= viewModel.steps.length) {
-      clearInterval(stepInterval)
-      cryptoResult.value = viewModel.finalResult
-      cryptoTotalTime.value = String(viewModel.totalDuration ?? '')
-      return
-    }
-    cryptoSteps.value[stepIdx].done = true
-    cryptoSteps.value[stepIdx].data = viewModel.steps[stepIdx].data
-    stepIdx++
-  }, 600)
+function onCryptoFlowComplete() {
+  // Trace 播完后结果已在面板内展示；此处保留钩子便于后续扩展
 }
 
 function buildOfflineViewModel() {
@@ -1213,12 +1173,33 @@ function buildOfflineViewModel() {
   const finalResult = isPass ? 1 : 0
   dataSource.steps[5].data[2].value = finalResult.toString()
 
+  const category = currentTrajectory.value?.category
+  const reasonCodes = category === 'time'
+    ? ['TIME_DEVIATION']
+    : category === 'spatial'
+      ? ['DEVIATION_TOO_LARGE']
+      : []
+  const status = isPass ? '通过' : '不通过'
+
   return {
     mode: 'offline',
     key: `${dataSource.key} · 离线演示`,
     steps: dataSource.steps.map((s) => ({ name: s.name, data: s.data })),
+    processTrace: buildSyntheticProcessTrace({
+      x1: '120',
+      x2: '260',
+      x3: category === 'time' ? '480' : '18',
+      x4: category === 'time' ? '900' : '45',
+      functionDef: 'f = verify(x)',
+      decrypted: String(finalResult),
+      thresholdK: thresholdK.value,
+      verificationStatus: status,
+      score: isPass ? 100 : 40,
+      reasonCodes,
+      anomalyDesc: currentTrajectory.value?.anomalyDesc || null
+    }),
     finalResult,
-    verificationStatus: isPass ? '通过' : '不通过',
+    verificationStatus: status,
     score: isPass ? 100 : 40,
     totalDuration: dataSource.totalDuration,
     decryptedResult: String(finalResult)
@@ -1235,6 +1216,7 @@ async function animateCryptoProcess() {
   cryptoMode.value = 'loading'
   cryptoKey.value = '请求 /api/ptmoc/verify ...'
   cryptoSteps.value = []
+  cryptoProcessTrace.value = []
   cryptoResult.value = null
   cryptoTotalTime.value = ''
   cryptoScore.value = null
@@ -1566,16 +1548,24 @@ watch(currentPage, (val) => {
   overflow: hidden;
 }
 .travel-sidebar {
-  width: 380px;
+  width: 520px;
   flex-shrink: 0;
   background: white;
   border-radius: 8px;
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
   overflow-y: auto;
-  padding: 16px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
+}
+
+/* PTMOC 密码流程（组件自带样式，此处仅容器） */
+.crypto-section {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
 }
 
 /* 计时器 */

@@ -80,7 +80,7 @@ export function shortHex(value, head = 8, tail = 4) {
 }
 
 /**
- * Build right-panel crypto steps from a real VerifyResponse.
+ * Build right-panel crypto view from a real VerifyResponse (processTrace-driven).
  */
 export function buildCryptoViewModel(response) {
   const cr = response?.cryptoResult && typeof response.cryptoResult === 'object'
@@ -145,19 +145,33 @@ export function buildCryptoViewModel(response) {
     const name = s.name || id
     return {
       id,
-      name: name.includes('PTMOC') || name.includes('系统') || name.includes('密钥') || name.includes('消息') || name.includes('加密') || name.includes('评估') || name.includes('解密') || name.includes('验证')
-        ? name
-        : name,
+      name,
       data: detailById[id] || [{ label: '描述', value: s.description || '—' }],
       duration: s.actualDuration
     }
   })
 
   const passed = response?.verificationStatus === '通过'
+  let processTrace = Array.isArray(response?.processTrace) ? response.processTrace : []
+  if (!processTrace.length) {
+    processTrace = buildSyntheticProcessTrace({
+      x1, x2, x3, x4,
+      functionDef: fn,
+      decrypted,
+      thresholdK: cr.thresholdK ?? response?.algorithmSummary?.thresholdK,
+      verificationStatus: response?.verificationStatus,
+      score: response?.score,
+      reasonCodes: response?.reasonCodes || [],
+      anomalyDesc: response?.anomalyDesc,
+      cryptoError: cr.error
+    })
+  }
+
   return {
     mode: 'online',
     key: `真实 PTMOC · k=${cr.thresholdK ?? response?.algorithmSummary?.thresholdK ?? '—'} · ${hasError ? 'crypto部分失败' : 'Encrypt/Eval/Decrypt OK'}`,
     steps,
+    processTrace,
     finalResult: passed ? 1 : 0,
     verificationStatus: response?.verificationStatus ?? '—',
     score: response?.score ?? null,
@@ -167,4 +181,72 @@ export function buildCryptoViewModel(response) {
     reasonDetails: response?.reasonDetails || [],
     cryptoError: cr.error || null
   }
+}
+
+/** 后端无 processTrace 或离线兜底时，合成可播放事件 */
+export function buildSyntheticProcessTrace(opts = {}) {
+  const k = opts.thresholdK ?? 3
+  const events = []
+  let order = 0
+  const push = (stage, actor, target, title, description, displayData) => {
+    events.push({ stage, actor, target, title, description, order: ++order, displayData: displayData || {} })
+  }
+
+  push('SETUP', 'SYSTEM', null, '系统初始化 Setup', '生成公共参数并分发', {
+    lambda: '256', rsa: '2048', note: '公共参数分发至四方'
+  })
+  push('KEYGEN', 'SYSTEM', null, '密钥生成 KeyGen', '四方生成密钥材料', {
+    entities: 'Sender / Server / CSP / Receiver', thresholdK: String(k), secretHint: '不展示完整私钥'
+  })
+  push('ENCODE', 'SENDER', null, '轨迹编码 Encode', 'Sender 将偏差编码为 x₁…x₄', {
+    x1: String(opts.x1 ?? '—'), x2: String(opts.x2 ?? '—'),
+    x3: String(opts.x3 ?? '—'), x4: String(opts.x4 ?? '—'),
+    x1Label: '平均空间偏差(cm)', x2Label: '最大空间偏差(cm)',
+    x3Label: '平均时间偏差(s)', x4Label: '最大时间偏差(s)',
+    function: String(opts.functionDef ?? '—')
+  })
+  push('ENCRYPT', 'SENDER', null, 'Shamir 分片 + 加密', '明文不离开 Sender', {
+    thresholdK: String(k), shareHint: '多项式秘密共享', plaintextOnServer: 'false'
+  })
+  push('ENCRYPT', 'SENDER', 'SERVER', '密文送达 Server', '加密份额发送至 Server', {
+    payload: 'Encrypted Shares', plaintext: '不可见'
+  })
+  push('ENCRYPT', 'SENDER', 'CSP', '辅助密文送达 CSP', '辅助数据发送至 CSP', {
+    payload: 'Auxiliary Ciphertext', plaintext: '不可见'
+  })
+  push('EVAL', 'SERVER', null, 'Server 密文评估', '密文域函数评估', {
+    action: 'Function Evaluation', function: String(opts.functionDef ?? 'f(x)'), domain: '密文域'
+  })
+  push('EVAL', 'CSP', null, 'CSP 掩码处理', '随机掩码协同', { action: 'Random Mask' })
+  push('EVAL', 'SERVER', 'RECEIVER', '密文结果送往 Receiver', '加密函数结果交接', {
+    result: 'Encrypted Function Result', plaintext: '不可见'
+  })
+  push('DECRYPT', 'RECEIVER', null, 'Receiver 解密', '恢复函数值而非原始轨迹', {
+    decryptedResult: String(opts.decrypted ?? '—'),
+    note: '恢复的是函数评估值，不是原始轨迹明文'
+  })
+
+  if (opts.cryptoError) {
+    push('RESULT', 'SYSTEM', null, '密码流程异常', '离线/失败兜底', { error: String(opts.cryptoError) })
+  }
+
+  const reasonCodes = opts.reasonCodes || []
+  const status = opts.verificationStatus || '—'
+  let badge = 'UNKNOWN'
+  if (status.includes('通过') && !reasonCodes.length) badge = 'PASS'
+  else if (reasonCodes.includes('TIME_DEVIATION')) badge = 'TIME ANOMALY'
+  else if (reasonCodes.includes('DEVIATION_TOO_LARGE') || reasonCodes.includes('PARTIAL_DEVIATION')) badge = 'SPATIAL DEVIATION'
+  else if (String(status).includes('不通过')) badge = 'FAIL'
+  else badge = status
+
+  push('RESULT', 'RECEIVER', null, '验证结论', '输出最终验证结果', {
+    verificationStatus: status,
+    score: opts.score ?? null,
+    resultBadge: badge,
+    privacyNote: '原始轨迹明文未发送给 Server / CSP',
+    reasonCodes,
+    anomalyDesc: opts.anomalyDesc || null
+  })
+
+  return events
 }

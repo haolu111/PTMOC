@@ -3,7 +3,6 @@ package com.ptmoc.service;
 import com.ptmoc.core.BaseModule;
 import com.ptmoc.core.CryptoModule;
 import com.ptmoc.core.EvalModule;
-import com.ptmoc.dto.TrajectoryPointDto;
 import com.ptmoc.dto.VerifyRequest;
 import com.ptmoc.dto.VerifyResponse;
 import com.ptmoc.model.Entity;
@@ -14,7 +13,7 @@ import java.util.*;
 
 /**
  * PTMOC算法编排服务：执行真实的 PTMOC 加密验证流程
- * Setup → KeyGen → Encrypt → Eval → Decrypt
+ * Setup → KeyGen → Encrypt → Eval → Decrypt，并由 CryptoTraceBuilder 产出 processTrace。
  */
 @Service
 public class PtmocService {
@@ -30,8 +29,8 @@ public class PtmocService {
     public VerifyResponse executeVerification(VerifyRequest request) {
         long totalStart = System.currentTimeMillis();
         List<Map<String, Object>> steps = new ArrayList<>();
+        CryptoTraceBuilder trace = new CryptoTraceBuilder();
 
-        // 步骤定义
         String[][] stepDefs = {
             {"init", "系统初始化", "PTMOC.Setup: 生成公共参数 (λ, p₀, η, 陷门置换对)"},
             {"keygen", "密钥生成", "PTMOC.KeyGen: 为Sender/Server/CSP/Receiver生成密钥对"},
@@ -46,14 +45,13 @@ public class PtmocService {
         Object cryptoResult = null;
 
         try {
-            // Step 1: Setup
             long t0 = System.currentTimeMillis();
             BaseModule baseModule = new BaseModule();
             baseModule.setup(256);
             long d0 = System.currentTimeMillis() - t0;
             steps.add(buildStep(stepDefs[0], d0));
+            trace.setup(d0);
 
-            // Step 2: KeyGen
             long t1 = System.currentTimeMillis();
             baseModule.keyGen(Entity.SENDER, "sender_1");
             baseModule.keyGen(Entity.SERVER, "server_1");
@@ -61,37 +59,37 @@ public class PtmocService {
             baseModule.keyGen(Entity.RECEIVER, "receiver_1");
             long d1 = System.currentTimeMillis() - t1;
             steps.add(buildStep(stepDefs[1], d1));
+            trace.keyGen(k, d1);
 
-            // Step 3: Encode
             long t2 = System.currentTimeMillis();
             Map<Integer, BigInteger> messages = trajectoryEncoder.encodeTrajectoryDeviations(
                 request.getUserTrajectory(), request.getReferenceTrajectory());
             String functionDef = trajectoryEncoder.buildVerificationFunction();
             long d2 = System.currentTimeMillis() - t2;
             steps.add(buildStep(stepDefs[2], d2));
+            trace.encode(messages, functionDef, d2);
 
-            // Step 4: Encrypt
             long t3 = System.currentTimeMillis();
             CryptoModule cryptoModule = new CryptoModule(baseModule);
             Map<String, Object> encryptionResult = cryptoModule.encrypt("sender_1", k, messages);
             long d3 = System.currentTimeMillis() - t3;
             steps.add(buildStep(stepDefs[3], d3));
+            trace.encrypt(k, messages, d3);
 
-            // Step 5: Evaluate
             long t4 = System.currentTimeMillis();
             EvalModule evalModule = new EvalModule(baseModule);
-            Map<String, java.math.BigInteger> evalResult = evalModule.evaluate(
+            Map<String, BigInteger> evalResult = evalModule.evaluate(
                 "server_1", "csp_1", encryptionResult, functionDef);
             long d4 = System.currentTimeMillis() - t4;
             steps.add(buildStep(stepDefs[4], d4));
+            trace.evaluate(functionDef, d4);
 
-            // Step 6: Decrypt
             long t5 = System.currentTimeMillis();
             BigInteger decryptedResult = cryptoModule.decrypt("receiver_1", evalResult);
             long d5 = System.currentTimeMillis() - t5;
             steps.add(buildStep(stepDefs[5], d5));
+            trace.decrypt(decryptedResult.toString(), d5);
 
-            // 保存密码学结果
             Map<String, Object> cr = new LinkedHashMap<>();
             cr.put("encodedMessages", messages.toString());
             cr.put("x1", messages.get(1).toString());
@@ -104,12 +102,11 @@ public class PtmocService {
             cryptoResult = cr;
 
         } catch (Exception e) {
-            // 如果密码学运算失败，仍继续验证流程
             System.err.println("PTMOC crypto error: " + e.getMessage());
-            cryptoResult = Map.of("error", e.getMessage());
+            cryptoResult = Map.of("error", e.getMessage() == null ? "unknown" : e.getMessage());
+            trace.cryptoFailed(e.getMessage());
         }
 
-        // Step 7: Verify (无论密码学是否成功，都做轨迹对比)
         long t6 = System.currentTimeMillis();
         TrajectoryVerifier.VerificationResult vr = trajectoryVerifier.verify(
             request.getUserTrajectory(),
@@ -118,10 +115,10 @@ public class PtmocService {
             request.getAnomalyDesc());
         long d6 = System.currentTimeMillis() - t6;
         steps.add(buildStep(stepDefs[6], d6));
+        trace.result(vr.verificationStatus, vr.score, vr.reasonCodes, vr.anomalyDesc);
 
         long totalDuration = System.currentTimeMillis() - totalStart;
 
-        // 构建响应
         VerifyResponse response = new VerifyResponse();
         response.setVerificationStatus(vr.verificationStatus);
         response.setScore(vr.score);
@@ -136,6 +133,7 @@ public class PtmocService {
         response.setSteps(steps);
         response.setTotalDuration(totalDuration);
         response.setCryptoResult(cryptoResult);
+        response.setProcessTrace(trace.getEvents());
 
         Map<String, Object> summary = new LinkedHashMap<>();
         summary.put("securityParameter", 256);
@@ -145,6 +143,7 @@ public class PtmocService {
         summary.put("totalSteps", steps.size());
         summary.put("encryptionType", "PTMOC (Privacy-Preserving Threshold Multi-Owner Cryptography)");
         summary.put("dataPoints", request.getUserTrajectory().size());
+        summary.put("processTraceEvents", trace.getEvents().size());
         response.setAlgorithmSummary(summary);
 
         return response;

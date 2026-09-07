@@ -14,6 +14,7 @@ import java.util.Map;
 
 /**
  * Mirrors backend PtmocService: real Setup → KeyGen → Encode → Encrypt → Eval → Decrypt → Verify.
+ * processTrace 由 CryptoTraceBuilder 生成，供前端密码数据流可视化重放。
  */
 public class PtmocDemoService {
 
@@ -23,6 +24,7 @@ public class PtmocDemoService {
     public VerifyResponse executeVerification(VerifyRequest request) {
         long totalStart = System.currentTimeMillis();
         List<Map<String, Object>> steps = new ArrayList<Map<String, Object>>();
+        CryptoTraceBuilder trace = new CryptoTraceBuilder();
 
         String[][] stepDefs = {
             {"init", "系统初始化", "PTMOC.Setup: 生成公共参数 (λ, p₀, η, 陷门置换对)"},
@@ -45,35 +47,47 @@ public class PtmocDemoService {
             long t0 = System.currentTimeMillis();
             BaseModule baseModule = new BaseModule();
             baseModule.setup(256);
-            steps.add(buildStep(stepDefs[0], System.currentTimeMillis() - t0));
+            long d0 = System.currentTimeMillis() - t0;
+            steps.add(buildStep(stepDefs[0], d0));
+            trace.setup(d0);
 
             long t1 = System.currentTimeMillis();
             baseModule.keyGen(Entity.SENDER, "sender_1");
             baseModule.keyGen(Entity.SERVER, "server_1");
             baseModule.keyGen(Entity.CSP, "csp_1");
             baseModule.keyGen(Entity.RECEIVER, "receiver_1");
-            steps.add(buildStep(stepDefs[1], System.currentTimeMillis() - t1));
+            long d1 = System.currentTimeMillis() - t1;
+            steps.add(buildStep(stepDefs[1], d1));
+            trace.keyGen(k, d1);
 
             long t2 = System.currentTimeMillis();
             messages = trajectoryEncoder.encodeTrajectoryDeviations(
                     request.getUserTrajectory(), request.getReferenceTrajectory());
             functionDef = trajectoryEncoder.buildVerificationFunction();
-            steps.add(buildStep(stepDefs[2], System.currentTimeMillis() - t2));
+            long d2 = System.currentTimeMillis() - t2;
+            steps.add(buildStep(stepDefs[2], d2));
+            trace.encode(messages, functionDef, d2);
 
             long t3 = System.currentTimeMillis();
             CryptoModule cryptoModule = new CryptoModule(baseModule);
             Map<String, Object> encryptionResult = cryptoModule.encrypt("sender_1", k, messages);
-            steps.add(buildStep(stepDefs[3], System.currentTimeMillis() - t3));
+            long d3 = System.currentTimeMillis() - t3;
+            steps.add(buildStep(stepDefs[3], d3));
+            trace.encrypt(k, messages, d3);
 
             long t4 = System.currentTimeMillis();
             EvalModule evalModule = new EvalModule(baseModule);
             Map<String, BigInteger> evalResult = evalModule.evaluate(
                     "server_1", "csp_1", encryptionResult, functionDef);
-            steps.add(buildStep(stepDefs[4], System.currentTimeMillis() - t4));
+            long d4 = System.currentTimeMillis() - t4;
+            steps.add(buildStep(stepDefs[4], d4));
+            trace.evaluate(functionDef, d4);
 
             long t5 = System.currentTimeMillis();
             decryptedResult = cryptoModule.decrypt("receiver_1", evalResult);
-            steps.add(buildStep(stepDefs[5], System.currentTimeMillis() - t5));
+            long d5 = System.currentTimeMillis() - t5;
+            steps.add(buildStep(stepDefs[5], d5));
+            trace.decrypt(decryptedResult.toString(), d5);
 
             Map<String, Object> cr = new LinkedHashMap<String, Object>();
             cr.put("encodedMessages", messages.toString());
@@ -91,7 +105,7 @@ public class PtmocDemoService {
             Map<String, Object> err = new HashMap<String, Object>();
             err.put("error", e.getMessage());
             cryptoResult = err;
-            // Keep step list complete for UI even if crypto failed mid-way
+            trace.cryptoFailed(e.getMessage());
             while (steps.size() < 6) {
                 steps.add(buildStep(stepDefs[steps.size()], 0));
             }
@@ -104,6 +118,7 @@ public class PtmocDemoService {
                 request.isTimeAnomaly(),
                 request.getAnomalyDesc());
         steps.add(buildStep(stepDefs[6], System.currentTimeMillis() - t6));
+        trace.result(vr.verificationStatus, vr.score, vr.reasonCodes, vr.anomalyDesc);
 
         VerifyResponse response = new VerifyResponse();
         response.setVerificationStatus(vr.verificationStatus);
@@ -119,6 +134,7 @@ public class PtmocDemoService {
         response.setSteps(steps);
         response.setTotalDuration(System.currentTimeMillis() - totalStart);
         response.setCryptoResult(cryptoResult);
+        response.setProcessTrace(trace.getEvents());
 
         Map<String, Object> summary = new LinkedHashMap<String, Object>();
         summary.put("securityParameter", 256);
@@ -128,6 +144,7 @@ public class PtmocDemoService {
         summary.put("totalSteps", steps.size());
         summary.put("encryptionType", "PTMOC (Privacy-Preserving Threshold Multi-Owner Cryptography)");
         summary.put("dataPoints", request.getUserTrajectory() == null ? 0 : request.getUserTrajectory().size());
+        summary.put("processTraceEvents", trace.getEvents().size());
         response.setAlgorithmSummary(summary);
         return response;
     }

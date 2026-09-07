@@ -18,6 +18,7 @@ public class VerifyResponse {
     private List<Map<String, Object>> steps;
     private long totalDuration;
     private Object cryptoResult;
+    private List<Map<String, Object>> processTrace;
     private String source = "ptmoc-jdk8-demo-server";
 
     public String getVerificationStatus() { return verificationStatus; }
@@ -48,6 +49,8 @@ public class VerifyResponse {
     public void setTotalDuration(long totalDuration) { this.totalDuration = totalDuration; }
     public Object getCryptoResult() { return cryptoResult; }
     public void setCryptoResult(Object cryptoResult) { this.cryptoResult = cryptoResult; }
+    public List<Map<String, Object>> getProcessTrace() { return processTrace; }
+    public void setProcessTrace(List<Map<String, Object>> processTrace) { this.processTrace = processTrace; }
     public String getSource() { return source; }
     public void setSource(String source) { this.source = source; }
 }

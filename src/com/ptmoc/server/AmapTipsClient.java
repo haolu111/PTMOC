@@ -475,11 +475,25 @@ public class AmapTipsClient {
             lastAmapCallAtMs = System.currentTimeMillis();
         }
 
+        try {
+            return httpGetJava(urlStr);
+        } catch (javax.net.ssl.SSLException sslEx) {
+            // 本机常见：JDK8 直连高德 CDN 时 TLS 握手被对端掐断；curl 通常正常
+            System.err.println("[Amap] Java HTTPS failed (" + sslEx.getMessage() + "), fallback to curl");
+            return httpGetCurl(urlStr);
+        } catch (java.net.SocketException se) {
+            System.err.println("[Amap] Java socket failed (" + se.getMessage() + "), fallback to curl");
+            return httpGetCurl(urlStr);
+        }
+    }
+
+    private static String httpGetJava(String urlStr) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
         conn.setReadTimeout(READ_TIMEOUT_MS);
         conn.setRequestProperty("Accept", "application/json");
+        conn.setRequestProperty("User-Agent", "PTMOC-Demo/1.0");
         int code = conn.getResponseCode();
         BufferedReader reader = new BufferedReader(new InputStreamReader(
                 code >= 400 ? conn.getErrorStream() : conn.getInputStream(), StandardCharsets.UTF_8));
@@ -495,5 +509,35 @@ public class AmapTipsClient {
             reader.close();
             conn.disconnect();
         }
+    }
+
+    /** macOS/本地代理环境下，用系统 curl 绕过 Java TLS 指纹被高德 CDN 拒绝的问题 */
+    private static String httpGetCurl(String urlStr) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "curl", "--noproxy", "*", "-sS", "-f",
+                "--connect-timeout", "5",
+                "--max-time", "12",
+                "-H", "Accept: application/json",
+                "-H", "User-Agent: PTMOC-Demo/1.0",
+                urlStr
+        );
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder();
+        try {
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line);
+        } finally {
+            reader.close();
+        }
+        int code = p.waitFor();
+        if (code != 0) {
+            throw new IllegalStateException(
+                    "地图服务 HTTPS 握手失败（Java SSL + curl 均不可用）。"
+                            + "请检查网络/代理；若开了 Clash 等代理，可尝试关闭系统 HTTPS 代理或换网络。详情: "
+                            + sb.toString());
+        }
+        return sb.toString();
     }
 }

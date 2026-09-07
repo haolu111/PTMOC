@@ -49,4 +49,4 @@ else
   echo "AMAP_WEB_KEY: configured"
 fi
 echo "Starting DemoHttpServer on port $PORT ..."
-exec java -cp "bin:$GSON_JAR" com.ptmoc.server.DemoHttpServer "$PORT"
+exec java -Djava.net.preferIPv4Stack=true -Dhttps.protocols=TLSv1.2 -cp "bin:$GSON_JAR" com.ptmoc.server.DemoHttpServer "$PORT"

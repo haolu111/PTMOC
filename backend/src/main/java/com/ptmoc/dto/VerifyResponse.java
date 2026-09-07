@@ -18,6 +18,7 @@ public class VerifyResponse {
     private List<Map<String, Object>> steps;
     private long totalDuration;
     private Object cryptoResult;
+    private List<Map<String, Object>> processTrace;
 
     public String getVerificationStatus() { return verificationStatus; }
     public void setVerificationStatus(String v) { this.verificationStatus = v; }
@@ -47,4 +48,6 @@ public class VerifyResponse {
     public void setTotalDuration(long v) { this.totalDuration = v; }
     public Object getCryptoResult() { return cryptoResult; }
     public void setCryptoResult(Object v) { this.cryptoResult = v; }
+    public List<Map<String, Object>> getProcessTrace() { return processTrace; }
+    public void setProcessTrace(List<Map<String, Object>> v) { this.processTrace = v; }
 }
