@@ -131,13 +131,14 @@ function haversineMeters(a, b) {
 }
 
 /**
- * 中段法向偏移，制造明显空间偏离；首尾贴合参考路线。
+ * 中段法向偏移：平滑偏出、持续偏离、平滑回归；首尾贴合参考路线。
  */
 function buildSpatialUserPath(refPoints) {
   const n = refPoints.length
-  const startIdx = Math.max(1, Math.floor(n * 0.35))
-  const endIdx = Math.min(n - 2, Math.floor(n * 0.7))
-  const offsetMeters = 140
+  const startIdx = Math.max(1, Math.floor(n * 0.2))
+  const endIdx = Math.min(n - 2, Math.floor(n * 0.85))
+  const offsetMeters = 500
+  const transitionRatio = 0.25 // 偏移区间前后各 25% 用于过渡，中间 50% 保持最大偏移
 
   // 偏移方向：取中段切线的法向
   const a = refPoints[startIdx]
@@ -155,9 +156,10 @@ function buildSpatialUserPath(refPoints) {
     if (i < startIdx || i > endIdx) {
       return { lat: p.lat, lng: p.lng }
     }
-    // 两端渐入渐出，中间满偏移
+    // 平滑抬升到最大偏移，保持一段后再平滑回归
     const t = (i - startIdx) / Math.max(1, endIdx - startIdx)
-    const envelope = Math.sin(Math.PI * t) // 0→1→0
+    const ramp = Math.min(1, t / transitionRatio, (1 - t) / transitionRatio)
+    const envelope = ramp * ramp * (3 - 2 * ramp)
     const meters = offsetMeters * envelope
     const dLat = (meters * ny) / 111000
     const dLng = (meters * nx) / (111000 * Math.cos((p.lat * Math.PI) / 180) || 1e-6)
