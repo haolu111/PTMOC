@@ -34,7 +34,10 @@ public class AmapService {
     private static final int STRATEGY_RECOMMEND = 32;
     private static final int STRATEGY_AVOID = 33;
     private static final int STRATEGY_FASTEST = 38;
-    private static final int[] EXTRA_STRATEGIES = {35, 36, 34};
+    private static final long AMAP_MIN_INTERVAL_MS = 400L;
+    private static final Object AMAP_LOCK = new Object();
+    private static long lastAmapCallAtMs = 0L;
+
 
     private final AmapProperties amapProperties;
 
@@ -115,36 +118,27 @@ public class AmapService {
         GeoPointDto dest = request.getDestination();
 
         try {
-            // 必须带 alternative_route=3，并按策略分别请求，避免三条变成同一条克隆
-            List<RoutePlanDto> recommendPaths = fetchAllDrivingPaths(origin, dest, STRATEGY_RECOMMEND, 3);
-            List<RoutePlanDto> avoidPaths = fetchAllDrivingPaths(origin, dest, STRATEGY_AVOID, 3);
-            List<RoutePlanDto> fastestPaths = fetchAllDrivingPaths(origin, dest, STRATEGY_FASTEST, 3);
-
+            // 默认只打 1 次高德（alternative_route=3），避免免费 Key 触发 CUQPS
             List<RoutePlanDto> pool = new ArrayList<>();
-            pool.addAll(recommendPaths);
-            pool.addAll(avoidPaths);
-            pool.addAll(fastestPaths);
-            if (dedupeRoutes(pool).size() < 3) {
-                for (int s : EXTRA_STRATEGIES) {
-                    pool.addAll(fetchAllDrivingPaths(origin, dest, s, 3));
-                    if (dedupeRoutes(pool).size() >= 3) break;
+            try {
+                pool.addAll(fetchAllDrivingPaths(origin, dest, STRATEGY_RECOMMEND, 3));
+            } catch (IllegalStateException e) {
+                throw new IllegalStateException(friendlyAmapError(e.getMessage()), e);
+            }
+            if (dedupeRoutes(pool).size() < 2) {
+                sleepQuietly(AMAP_MIN_INTERVAL_MS);
+                try {
+                    pool.addAll(fetchAllDrivingPaths(origin, dest, STRATEGY_AVOID, 3));
+                } catch (IllegalStateException ignored) {
+                    // 已有主路线则忽略补充失败
                 }
             }
             if (pool.isEmpty()) {
                 throw new IllegalStateException("无可用路径");
             }
 
-            RoutePlanDto recommend = firstOrBest(recommendPaths, pool, false);
-            RoutePlanDto avoid = pickDifferent(avoidPaths, pool, recommend, null, false);
-            RoutePlanDto fastest = pickDifferent(fastestPaths, pool, recommend, avoid, true);
-
-            List<RoutePlanDto> routes = new ArrayList<>();
-            routes.add(cloneNamed(recommend, "route-recommend", "推荐路线", STRATEGY_RECOMMEND));
-            routes.add(cloneNamed(avoid, "route-avoid-congestion", "躲避拥堵", STRATEGY_AVOID));
-            routes.add(cloneNamed(fastest, "route-fastest", "速度最快", STRATEGY_FASTEST));
-
             RoutePlanResponse response = new RoutePlanResponse();
-            response.setRoutes(routes);
+            response.setRoutes(labelThreeRoutes(pool));
             return response;
         } catch (IllegalStateException e) {
             throw e;
@@ -153,50 +147,50 @@ public class AmapService {
         }
     }
 
-    private static RoutePlanDto firstOrBest(List<RoutePlanDto> preferred, List<RoutePlanDto> pool, boolean preferFast) {
-        if (preferred != null && !preferred.isEmpty()) return preferred.get(0);
-        if (pool == null || pool.isEmpty()) throw new IllegalStateException("无可用路径");
-        if (!preferFast) return pool.get(0);
-        RoutePlanDto best = pool.get(0);
-        for (RoutePlanDto r : pool) {
-            if (r.getDurationSeconds() < best.getDurationSeconds()) best = r;
-        }
-        return best;
-    }
+    private static List<RoutePlanDto> labelThreeRoutes(List<RoutePlanDto> candidates) {
+        List<RoutePlanDto> unique = dedupeRoutes(candidates);
+        RoutePlanDto recommend = unique.get(0);
 
-    private static RoutePlanDto pickDifferent(
-            List<RoutePlanDto> preferred,
-            List<RoutePlanDto> pool,
-            RoutePlanDto excludeA,
-            RoutePlanDto excludeB,
-            boolean preferFast) {
-        if (preferred != null) {
-            RoutePlanDto best = null;
-            for (RoutePlanDto r : preferred) {
-                if (sameRoute(r, excludeA) || sameRoute(r, excludeB)) continue;
-                if (best == null) best = r;
-                else if (preferFast && r.getDurationSeconds() < best.getDurationSeconds()) best = r;
-                else if (!preferFast && routeDiffScore(r, excludeA) > routeDiffScore(best, excludeA)) best = r;
-            }
-            if (best != null) return best;
-        }
-        RoutePlanDto best = null;
-        for (RoutePlanDto r : pool) {
-            if (sameRoute(r, excludeA) || sameRoute(r, excludeB)) continue;
-            if (best == null) {
-                best = r;
-                continue;
-            }
-            if (preferFast) {
-                if (r.getDurationSeconds() < best.getDurationSeconds()) best = r;
-            } else if (routeDiffScore(r, excludeA) > routeDiffScore(best, excludeA)) {
-                best = r;
+        RoutePlanDto fastest = recommend;
+        for (RoutePlanDto r : unique) {
+            if (r.getDurationSeconds() < fastest.getDurationSeconds()) {
+                fastest = r;
             }
         }
-        if (best != null) return best;
-        if (preferred != null && !preferred.isEmpty()) return preferred.get(0);
-        if (excludeA != null) return excludeA;
-        return pool.get(0);
+        if (sameRoute(fastest, recommend)) {
+            for (RoutePlanDto r : unique) {
+                if (!sameRoute(r, recommend)
+                        && (sameRoute(fastest, recommend) || r.getDurationSeconds() < fastest.getDurationSeconds())) {
+                    fastest = r;
+                }
+            }
+        }
+
+        RoutePlanDto avoid = null;
+        long bestDiff = -1;
+        for (RoutePlanDto r : unique) {
+            if (sameRoute(r, recommend) || sameRoute(r, fastest)) continue;
+            long diff = routeDiffScore(r, recommend);
+            if (diff > bestDiff) {
+                bestDiff = diff;
+                avoid = r;
+            }
+        }
+        if (avoid == null) {
+            for (RoutePlanDto r : unique) {
+                if (!sameRoute(r, recommend)) {
+                    avoid = r;
+                    break;
+                }
+            }
+        }
+        if (avoid == null) avoid = recommend;
+
+        List<RoutePlanDto> routes = new ArrayList<>();
+        routes.add(cloneNamed(recommend, "route-recommend", "推荐路线", STRATEGY_RECOMMEND));
+        routes.add(cloneNamed(avoid, "route-avoid-congestion", "躲避拥堵", STRATEGY_AVOID));
+        routes.add(cloneNamed(fastest, "route-fastest", "速度最快", STRATEGY_FASTEST));
+        return routes;
     }
 
     private static long routeDiffScore(RoutePlanDto r, RoutePlanDto base) {
@@ -204,6 +198,26 @@ public class AmapService {
         return Math.abs(r.getDistanceMeters() - base.getDistanceMeters())
                 + Math.abs(r.getDurationSeconds() - base.getDurationSeconds()) * 10
                 + Math.abs(r.getTrafficLights() - base.getTrafficLights()) * 100L;
+    }
+
+    private static String friendlyAmapError(String raw) {
+        if (raw == null) return "路径规划失败";
+        String u = raw.toUpperCase();
+        if (u.contains("CUQPS") || u.contains("CQPS") || u.contains("EXCEEDED_THE_LIMIT") || u.contains("DAILY_QUERY")) {
+            return "地图服务请求过于频繁，请等待几秒后再点「规划路线」（免费 Key 有并发/次数限制）";
+        }
+        if (u.contains("INVALID_USER_KEY") || u.contains("USERKEY_PLAT_NOMATCH")) {
+            return "高德 Key 无效或平台不匹配，请检查 AMAP_WEB_KEY 配置";
+        }
+        return raw;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static List<RoutePlanDto> dedupeRoutes(List<RoutePlanDto> routes) {
@@ -413,6 +427,19 @@ public class AmapService {
     }
 
     private static String httpGet(String urlStr) throws Exception {
+        synchronized (AMAP_LOCK) {
+            long now = System.currentTimeMillis();
+            long wait = AMAP_MIN_INTERVAL_MS - (now - lastAmapCallAtMs);
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            lastAmapCallAtMs = System.currentTimeMillis();
+        }
+
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(CONNECT_TIMEOUT_MS);

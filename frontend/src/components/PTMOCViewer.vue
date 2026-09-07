@@ -84,10 +84,11 @@
 
         <div class="toolbar-demo">
           <div class="form-row">
-            <label>演示路线（可选）</label>
-            <select v-model="selectedEnd" @change="onEndChange">
-              <option value="">不使用预设</option>
-              <option v-for="e in endPoints" :key="e" :value="e">人民广场 → {{ e }}</option>
+            <label>行程场景</label>
+            <select v-model="travelScenario">
+              <option v-for="opt in scenarioSelectOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
             </select>
           </div>
           <button class="verify-btn" :disabled="!canStart || isTraveling" @click="startTravel">
@@ -288,8 +289,8 @@
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { getEndPointsForStart, getRouteByStartEnd } from '../data/trajectoryData.js'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
+import { buildScenarioTrajectory, scenarioOptions } from '../data/trajectoryScenario.js'
 import { verifyTrajectory, buildCryptoViewModel } from '../api/ptmocApi.js'
 import { emptyLocation, isLocationSelected, planRoutes } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
@@ -336,9 +337,16 @@ function wgs84ToGcj02(lat, lng) {
   dLng = (dLng * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI)
   return { lat: lat + dLat, lng: lng + dLng }
 }
-// 将轨迹点数组从WGS-84转为GCJ-02
-function convertPts(pts) {
-  return pts.map(p => { const c = wgs84ToGcj02(p.lat, p.lng); return { ...p, lat: c.lat, lng: c.lng } })
+// 将轨迹点转为地图展示坐标（GCJ-02）
+function convertPts(pts, coordSystem) {
+  const sys = coordSystem || currentTrajectory.value?.coordSystem || 'wgs84'
+  if (sys === 'gcj02') {
+    return pts.map((p) => ({ ...p, lat: p.lat, lng: p.lng }))
+  }
+  return pts.map((p) => {
+    const c = wgs84ToGcj02(p.lat, p.lng)
+    return { ...p, lat: c.lat, lng: c.lng }
+  })
 }
 
 function createColorIcon(color) {
@@ -532,8 +540,6 @@ function handleLogout() {
 }
 
 // ========== 主页状态 ==========
-const selectedStart = ref('人民广场')
-const selectedEnd = ref('')
 const thresholdK = ref(3)
 const currentTrajectory = ref(null)
 const isTraveling = ref(false)
@@ -546,9 +552,13 @@ const plannedRoutes = ref([])
 const selectedRouteId = ref('')
 const selectedPlannedRoute = ref(null)
 const planningLoading = ref(false)
+const travelScenario = ref('pass')
+const scenarioSelectOptions = scenarioOptions()
 
-const endPoints = computed(() => getEndPointsForStart('人民广场'))
-const canStart = computed(() => selectedEnd.value && currentTrajectory.value)
+const canStart = computed(() => {
+  if (isTraveling.value) return false
+  return !!(selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2)
+})
 
 // 地图
 const mapRef = ref(null)
@@ -637,9 +647,15 @@ function drawPlannedRoutes() {
 function onSelectPlannedRoute(route) {
   selectedRouteId.value = route.routeId
   selectedPlannedRoute.value = route
+  currentTrajectory.value = null
   planHintType.value = 'ok'
-  planHint.value = `已选择参考路线：${route.name}（${(route.distanceMeters / 1000).toFixed(1)} km / ${Math.round(route.durationSeconds / 60)} min）`
+  planHint.value = `已选择参考路线：${route.name}（${(route.distanceMeters / 1000).toFixed(1)} km / ${Math.round(route.durationSeconds / 60)} min）· 场景「${scenarioLabel(travelScenario.value)}」后可开始行程`
   drawPlannedRoutes()
+}
+
+function scenarioLabel(value) {
+  const hit = scenarioSelectOptions.find((o) => o.value === value)
+  return hit ? hit.label : value
 }
 
 async function onPlanRoute() {
@@ -650,7 +666,6 @@ async function onPlanRoute() {
     return
   }
 
-  selectedEnd.value = ''
   currentTrajectory.value = null
   plannedRoutes.value = []
   selectedRouteId.value = ''
@@ -679,11 +694,21 @@ async function onPlanRoute() {
     planHint.value = `已规划 ${routes.length} 条路线，默认选中「${routes[0].name}」作为参考路线`
   } catch (err) {
     planHintType.value = 'warn'
-    planHint.value = err?.message || '路径规划失败'
-    showAlert('warning', err?.message || '路径规划失败，请检查后端与高德 Key')
+    const msg = formatPlanError(err?.message) || '路径规划失败'
+    planHint.value = msg
+    showAlert('warning', msg)
   } finally {
     planningLoading.value = false
   }
+}
+
+function formatPlanError(raw) {
+  if (!raw) return ''
+  const u = String(raw).toUpperCase()
+  if (u.includes('CUQPS') || u.includes('EXCEEDED_THE_LIMIT') || u.includes('DAILY_QUERY')) {
+    return '地图服务请求过于频繁，请等待几秒后再点「规划路线」'
+  }
+  return String(raw)
 }
 
 watch(startLocation, () => {
@@ -711,41 +736,20 @@ watch(endLocation, () => {
   }
 }, { deep: true })
 
-function onEndChange() {
-  if (!selectedEnd.value) {
-    currentTrajectory.value = null
-    planHint.value = ''
-    nextTick(() => {
-      clearMainOverlays()
-      refreshEndpointMarkers()
-      if (plannedRoutes.value.length) drawPlannedRoutes()
-    })
-    return
-  }
-  // 使用演示路线时清空动态规划结果
-  plannedRoutes.value = []
-  selectedRouteId.value = ''
-  selectedPlannedRoute.value = null
-  const data = getRouteByStartEnd('人民广场', selectedEnd.value)
-  if (data) {
-    currentTrajectory.value = data
-    planHintType.value = 'info'
-    planHint.value = `已加载演示路线：人民广场 → ${selectedEnd.value}`
-    nextTick(() => updateMainMap())
-  }
-}
-
 function updateMainMap() {
   if (!mainMap || !currentTrajectory.value) return
   mainMap.invalidateSize()
   clearMainOverlays()
 
-  const refPts = convertPts(currentTrajectory.value.referenceTrajectory)
+  const refPts = convertPts(
+    currentTrajectory.value.referenceTrajectory,
+    currentTrajectory.value.coordSystem
+  )
   const refLatLngs = refPts.map(p => [p.lat, p.lng])
   L.polyline(refLatLngs, { color: REF_COLOR, weight: 3, opacity: 0.7, dashArray: '10, 7' }).addTo(mainMap)
 
-  startMarker = L.marker(refLatLngs[0], { icon: createColorIcon('#52c41a') }).addTo(mainMap).bindPopup('起点: 人民广场')
-  endMarker = L.marker(refLatLngs[refLatLngs.length - 1], { icon: createColorIcon('#ff4d4f') }).addTo(mainMap).bindPopup('终点: ' + currentTrajectory.value.end)
+  startMarker = L.marker(refLatLngs[0], { icon: createColorIcon('#52c41a') }).addTo(mainMap).bindPopup('起点: ' + (currentTrajectory.value.start || '起点'))
+  endMarker = L.marker(refLatLngs[refLatLngs.length - 1], { icon: createColorIcon('#ff4d4f') }).addTo(mainMap).bindPopup('终点: ' + (currentTrajectory.value.end || '终点'))
 
   mainMap.fitBounds(L.latLngBounds(refLatLngs), { padding: [50, 50] })
 }
@@ -929,8 +933,35 @@ function formatTimer(minutes) {
 }
 
 // ========== 开始行程 ==========
+function prepareTrajectoryForTravel() {
+  if (selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2) {
+    const route = selectedPlannedRoute.value
+    return buildScenarioTrajectory({
+      referencePoints: route.polyline,
+      startName: startLocation.value?.name || '起点',
+      endName: endLocation.value?.name || '终点',
+      durationSeconds: route.durationSeconds,
+      scenario: travelScenario.value,
+      coordSystem: 'gcj02',
+      sourceRouteId: route.routeId
+    })
+  }
+
+  throw new Error('请先规划并选择一条参考路线')
+}
+
 function startTravel() {
   if (!canStart.value || isTraveling.value) return
+
+  let traj
+  try {
+    traj = prepareTrajectoryForTravel()
+  } catch (err) {
+    showAlert('warning', err?.message || '无法生成行程轨迹')
+    return
+  }
+  currentTrajectory.value = traj
+
   // 清理之前的定时器
   if (pathAnimTimeout) { cancelAnimationFrame(pathAnimTimeout); pathAnimTimeout = null }
   if (travelTimerInterval) { clearInterval(travelTimerInterval); travelTimerInterval = null }
@@ -972,7 +1003,10 @@ function initTravelMap() {
     travelMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) travelMap.removeLayer(l) })
 
     // 参考轨迹
-    const refPts = convertPts(currentTrajectory.value.referenceTrajectory)
+    const refPts = convertPts(
+      currentTrajectory.value.referenceTrajectory,
+      currentTrajectory.value.coordSystem
+    )
     const refLatLngs = refPts.map(p => [p.lat, p.lng])
     L.polyline(refLatLngs, { color: REF_COLOR, weight: 3, opacity: 0.5, dashArray: '10, 7' }).addTo(travelMap)
 
@@ -991,89 +1025,21 @@ function initTravelMap() {
 
 function startPathAnimation() {
   const category = currentTrajectory.value.category
-  const refPts = convertPts(currentTrajectory.value.referenceTrajectory)
-
-  // ===== 构建实际展示的用户轨迹 =====
-  let displayPts = []
-  let deviationSplitIndex = -1
-
-  if (category === 'spatial') {
-    // 用户选中偏离点索引（来自调试页）
-    const forkRefIndex = selectedForkIndex.value >= 0 ? selectedForkIndex.value : 12
-
-    // 获取alt轨迹原始坐标（WGS-84），转GCJ-02
-    const altKey = currentTrajectory.value.start + '→' + currentTrajectory.value.end + '_alt'
-    const altRawCoords = ROUTE_COORDS[altKey]
-    const altPts = altRawCoords ? convertPts(altRawCoords.map(c => ({ lat: c[0], lng: c[1] }))) : []
-
-    // 偏离点前：严格走参考轨迹（0 ~ forkRefIndex，含偏离点本身）
-    // 偏离点后：切换到alt轨迹，平移修正对齐
-
-    // 计算参考轨迹偏离点坐标
-    const refForkPt = refPts[forkRefIndex]
-    // 在alt轨迹中找到距离refForkPt最近的点
-    let nearestAltIdx = forkRefIndex // 默认同索引
-    let minDist = Infinity
-    if (altPts.length > 0) {
-      for (let i = 0; i < altPts.length; i++) {
-        const dlat = altPts[i].lat - refForkPt.lat
-        const dlng = altPts[i].lng - refForkPt.lng
-        const d = dlat * dlat + dlng * dlng
-        if (d < minDist) { minDist = d; nearestAltIdx = i }
-      }
-    }
-
-    // alt轨迹从nearestAltIdx开始，走3个路段（4个点）后触发警告
-    const altSegments = 3
-    const altEndIdx = Math.min(nearestAltIdx + altSegments + 1, altPts.length)
-
-    // 取出alt路线片段 [nearestAltIdx .. altEndIdx-1]
-    const altSlice = altPts.slice(nearestAltIdx, altEndIdx)
-
-    // 平移修正：将altSlice的第一个点对齐到refForkPt
-    // 偏移量 = refForkPt - altSlice[0]
-    const offsetLat = refForkPt.lat - altSlice[0].lat
-    const offsetLng = refForkPt.lng - altSlice[0].lng
-
-    // 应用平移：将整个altSlice平移，使起始点与refForkPt重合
-    // 对后续点做渐变修正：越远的点偏移越小（线性衰减到0），
-    // 这样在第2-3个点处轨迹自然过渡到alt原始方向
-    const correctedAltSlice = altSlice.map((pt, i) => {
-      if (i === 0) {
-        // 第一个点：完全对齐到refForkPt
-        return { lat: refForkPt.lat, lng: refForkPt.lng }
-      }
-      // 渐变衰减：从1衰减到0，让轨迹逐渐回归到alt原始方向
-      const decay = 1 - (i / altSlice.length)
-      return {
-        lat: pt.lat + offsetLat * decay,
-        lng: pt.lng + offsetLng * decay
-      }
-    })
-
-    displayPts = [
-      ...refPts.slice(0, forkRefIndex),      // 参考轨迹 0..forkRefIndex-1
-      ...correctedAltSlice                    // 从偏离点开始走alt路线（3个路段）
-    ]
-    deviationSplitIndex = forkRefIndex  // displayPts中偏移开始的索引
-  } else {
-    // 时间异常和准确无误：路线相同，用参考轨迹
-    displayPts = [...refPts]
-  }
+  const coordSystem = currentTrajectory.value.coordSystem || 'wgs84'
+  // 动画始终跟随「用户轨迹」（场景生成器已写入正常/偏移路径）
+  const displayPts = convertPts(currentTrajectory.value.userTrajectory, coordSystem)
 
   const totalDisplayPoints = displayPts.length
 
-  // ===== 计算每个线段的距离 =====
   function pointDist(p1, p2) {
     const latDiff = p1.lat - p2.lat
     const lngDiff = p1.lng - p2.lng
-    return Math.sqrt(latDiff * latDiff + lngDiff * lngDiff) * 111000 // 米
+    return Math.sqrt(latDiff * latDiff + lngDiff * lngDiff) * 111000
   }
 
-  // 计算总距离和每段累计距离
   let totalDist = 0
-  const segDistances = [] // 每段距离
-  const cumDistances = [0] // 累计距离（从0开始）
+  const segDistances = []
+  const cumDistances = [0]
   for (let i = 1; i < totalDisplayPoints; i++) {
     const d = pointDist(displayPts[i - 1], displayPts[i])
     segDistances.push(d)
@@ -1081,35 +1047,29 @@ function startPathAnimation() {
     cumDistances.push(totalDist)
   }
 
-  // 匀速运动：全程约20秒
-  const totalDuration = 20000 // 毫秒
-  const speed = totalDist / totalDuration // 米/毫秒
+  const totalDuration = 20000
+  const speed = totalDist > 0 ? totalDist / totalDuration : 0
 
-  // 时间异常的停止距离位置
   const timeAnomalyStopDist = category === 'time'
     ? cumDistances[Math.floor(totalDisplayPoints * 0.45)]
     : -1
 
-  // ===== 计时器：1真实秒 = 1模拟分钟 =====
   travelTimerInterval = setInterval(() => {
     travelTimer.value++
   }, 1000)
 
-  // ===== 连续动画（requestAnimationFrame） =====
   let animStartTime = null
-  let animPausedAt = null // 暂停时已经走过的距离
+  let animPausedAt = null
   let timeAnomalyPaused = false
   let timeAnomalyResumeTime = null
   let animFinished = false
 
-  // 根据已走距离，计算当前应该在哪个位置（插值）
   function getPositionAtDist(dist) {
     if (dist <= 0) return { lat: displayPts[0].lat, lng: displayPts[0].lng, segIdx: 0 }
     if (dist >= totalDist) {
       const last = displayPts[displayPts.length - 1]
-      return { lat: last.lat, lng: last.lng, segIdx: displayPts.length - 2 }
+      return { lat: last.lat, lng: last.lng, segIdx: Math.max(0, displayPts.length - 2) }
     }
-    // 找到dist落在哪个线段
     let segIdx = 0
     for (let i = 1; i < cumDistances.length; i++) {
       if (dist <= cumDistances[i]) { segIdx = i - 1; break }
@@ -1126,15 +1086,12 @@ function startPathAnimation() {
     }
   }
 
-  // 根据已走距离，生成蓝线的所有点（经过的所有waypoint + 当前插值点）
   function getBlueLinePoints(dist) {
     const pos = getPositionAtDist(dist)
     const pts = []
-    // 加上所有已经过的waypoint
     for (let i = 0; i <= pos.segIdx; i++) {
       pts.push([displayPts[i].lat, displayPts[i].lng])
     }
-    // 加上当前插值点（如果不在waypoint上）
     const lastWP = displayPts[pos.segIdx]
     if (Math.abs(pos.lat - lastWP.lat) > 1e-8 || Math.abs(pos.lng - lastWP.lng) > 1e-8) {
       pts.push([pos.lat, pos.lng])
@@ -1147,11 +1104,10 @@ function startPathAnimation() {
 
     if (!animStartTime) animStartTime = timestamp
 
-    // 时间异常暂停逻辑
     if (timeAnomalyPaused) {
       if (timestamp >= timeAnomalyResumeTime) {
         timeAnomalyPaused = false
-        animStartTime = timestamp - (animPausedAt / speed) // 调整起始时间使动画从暂停位置继续
+        animStartTime = timestamp - (animPausedAt / speed)
       } else {
         pathAnimTimeout = requestAnimationFrame(animFrame)
         return
@@ -1160,32 +1116,25 @@ function startPathAnimation() {
 
     const elapsed = timestamp - animStartTime
     const currentDist = Math.min(speed * elapsed, totalDist)
-
-    // 获取当前位置
     const pos = getPositionAtDist(currentDist)
 
-    // 更新小车位置
     if (carMarker) {
       carMarker.setLatLng([pos.lat, pos.lng])
     }
 
-    // 更新蓝线
     const bluePts = getBlueLinePoints(currentDist)
     if (bluePts.length >= 2) {
       currentUserLatLngs = bluePts
       userPolyline.setLatLngs(currentUserLatLngs)
     }
 
-    // 地图跟随
     if (travelMap) {
       travelMap.panTo([pos.lat, pos.lng], { animate: false })
     }
 
-    // === 时间异常：到达停止点时暂停5秒后终止并弹窗 ===
     if (category === 'time' && timeAnomalyStopDist > 0 && currentDist >= timeAnomalyStopDist && !timeAnomalyPaused) {
       timeAnomalyPaused = true
       animPausedAt = currentDist
-      // 停留5秒后直接终止并弹窗
       setTimeout(() => {
         animFinished = true
         travelAlertFired = true
@@ -1197,8 +1146,7 @@ function startPathAnimation() {
       return
     }
 
-    // === 路线偏移：到达终点后停顿再弹窗 ===
-    if (category === 'spatial' && deviationSplitIndex > 0 && currentDist >= totalDist) {
+    if (category === 'spatial' && currentDist >= totalDist) {
       animFinished = true
       setTimeout(() => {
         travelAlertFired = true
@@ -1210,7 +1158,6 @@ function startPathAnimation() {
       return
     }
 
-    // === 正常到达终点 ===
     if (category === 'pass' && currentDist >= totalDist) {
       animFinished = true
       clearInterval(travelTimerInterval)
@@ -1222,13 +1169,11 @@ function startPathAnimation() {
       return
     }
 
-    // 继续动画
     if (currentDist < totalDist) {
       pathAnimTimeout = requestAnimationFrame(animFrame)
     }
   }
 
-  // 启动连续动画
   pathAnimTimeout = requestAnimationFrame(animFrame)
 }
 

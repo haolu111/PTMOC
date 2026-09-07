@@ -26,11 +26,15 @@ public class AmapTipsClient {
     private static final int CONNECT_TIMEOUT_MS = 3000;
     private static final int READ_TIMEOUT_MS = 5000;
     private static final int MAX_POLYLINE_POINTS = 1500;
-    /** 32 推荐 / 33 躲避拥堵 / 38 速度最快；另用 35、36 作差异补充 */
+    /** 32 推荐 / 33 躲避拥堵 / 38 速度最快（展示标签用；默认只请求 32） */
     private static final int STRATEGY_RECOMMEND = 32;
     private static final int STRATEGY_AVOID = 33;
     private static final int STRATEGY_FASTEST = 38;
-    private static final int[] EXTRA_STRATEGIES = {35, 36, 34};
+    /** 免费 Key 常见 QPS≈1~3，两次高德调用至少间隔这么久 */
+    private static final long AMAP_MIN_INTERVAL_MS = 400L;
+    private static final Object AMAP_LOCK = new Object();
+    private static long lastAmapCallAtMs = 0L;
+
 
     private final String apiKey;
 
@@ -104,8 +108,9 @@ public class AmapTipsClient {
     }
 
     /**
-     * 规划 3 条驾车路线：推荐路线 / 躲避拥堵 / 速度最快。
-     * 必须带 alternative_route=3，并按策略分别请求，避免三条变成同一条的克隆。
+     * 规划最多 3 条驾车路线：推荐路线 / 躲避拥堵 / 速度最快。
+     * 默认只打 1 次高德（alternative_route=3），避免免费 Key 触发 CUQPS 限流；
+     * 若备选不足，间隔后再补 1 次不同策略。
      */
     public Map<String, Object> planDrivingRoutes(double originLng, double originLat,
                                                  double destLng, double destLat) throws Exception {
@@ -113,38 +118,117 @@ public class AmapTipsClient {
             throw new IllegalStateException("高德 Key 未配置，请设置环境变量 AMAP_WEB_KEY");
         }
 
-        List<Map<String, Object>> recommendPaths = fetchAllDrivingPaths(originLng, originLat, destLng, destLat, STRATEGY_RECOMMEND, 3);
-        List<Map<String, Object>> avoidPaths = fetchAllDrivingPaths(originLng, originLat, destLng, destLat, STRATEGY_AVOID, 3);
-        List<Map<String, Object>> fastestPaths = fetchAllDrivingPaths(originLng, originLat, destLng, destLat, STRATEGY_FASTEST, 3);
-
         List<Map<String, Object>> pool = new ArrayList<Map<String, Object>>();
-        pool.addAll(recommendPaths);
-        pool.addAll(avoidPaths);
-        pool.addAll(fastestPaths);
+        try {
+            pool.addAll(fetchAllDrivingPaths(originLng, originLat, destLng, destLat, STRATEGY_RECOMMEND, 3));
+        } catch (IllegalStateException e) {
+            throw new IllegalStateException(friendlyAmapError(e.getMessage()), e);
+        }
 
-        // 若仍不够三条互异路线，用「不走高速 / 少收费 / 高速优先」补充
-        if (dedupeRoutes(pool).size() < 3) {
-            for (int s : EXTRA_STRATEGIES) {
-                pool.addAll(fetchAllDrivingPaths(originLng, originLat, destLng, destLat, s, 3));
-                if (dedupeRoutes(pool).size() >= 3) break;
+        // 仅当互异路线不足 2 条时，再补一次（带间隔，降低 QPS）
+        if (dedupeRoutes(pool).size() < 2) {
+            sleepQuietly(AMAP_MIN_INTERVAL_MS);
+            try {
+                pool.addAll(fetchAllDrivingPaths(originLng, originLat, destLng, destLat, STRATEGY_AVOID, 3));
+            } catch (IllegalStateException e) {
+                if (pool.isEmpty()) {
+                    throw new IllegalStateException(friendlyAmapError(e.getMessage()), e);
+                }
+                // 已有主路线则忽略补充失败
             }
         }
         if (pool.isEmpty()) {
             throw new IllegalStateException("无可用路径");
         }
 
-        Map<String, Object> recommend = firstOrBest(recommendPaths, pool, false);
-        Map<String, Object> avoid = pickDifferent(avoidPaths, pool, recommend, null, false);
-        Map<String, Object> fastest = pickDifferent(fastestPaths, pool, recommend, avoid, true);
+        List<Map<String, Object>> routes = labelThreeRoutes(pool);
+        Map<String, Object> response = new LinkedHashMap<String, Object>();
+        response.put("routes", routes);
+        return response;
+    }
+
+    /** 从候选中选出三条并打上展示名（不再为每个名字单独请求高德） */
+    private static List<Map<String, Object>> labelThreeRoutes(List<Map<String, Object>> candidates) {
+        List<Map<String, Object>> unique = dedupeRoutes(candidates);
+        Map<String, Object> recommend = unique.get(0);
+
+        Map<String, Object> fastest = recommend;
+        for (Map<String, Object> r : unique) {
+            if (asLong(r.get("durationSeconds")) < asLong(fastest.get("durationSeconds"))) {
+                fastest = r;
+            }
+        }
+        if (sameRoute(fastest, recommend)) {
+            for (Map<String, Object> r : unique) {
+                if (!sameRoute(r, recommend)) {
+                    if (sameRoute(fastest, recommend)
+                            || asLong(r.get("durationSeconds")) < asLong(fastest.get("durationSeconds"))) {
+                        fastest = r;
+                    }
+                }
+            }
+        }
+
+        Map<String, Object> avoid = null;
+        long bestDiff = -1;
+        for (Map<String, Object> r : unique) {
+            if (sameRoute(r, recommend) || sameRoute(r, fastest)) continue;
+            long diff = routeDiffScore(r, recommend);
+            if (diff > bestDiff) {
+                bestDiff = diff;
+                avoid = r;
+            }
+        }
+        if (avoid == null) {
+            for (Map<String, Object> r : unique) {
+                if (!sameRoute(r, recommend) && !sameRoute(r, fastest)) {
+                    avoid = r;
+                    break;
+                }
+            }
+        }
+        if (avoid == null) {
+            for (Map<String, Object> r : unique) {
+                if (!sameRoute(r, recommend)) {
+                    avoid = r;
+                    break;
+                }
+            }
+        }
+        if (avoid == null) avoid = recommend;
 
         List<Map<String, Object>> routes = new ArrayList<Map<String, Object>>();
         routes.add(cloneNamed(recommend, "route-recommend", "推荐路线", STRATEGY_RECOMMEND));
         routes.add(cloneNamed(avoid, "route-avoid-congestion", "躲避拥堵", STRATEGY_AVOID));
         routes.add(cloneNamed(fastest, "route-fastest", "速度最快", STRATEGY_FASTEST));
+        return routes;
+    }
 
-        Map<String, Object> response = new LinkedHashMap<String, Object>();
-        response.put("routes", routes);
-        return response;
+    private static long routeDiffScore(Map<String, Object> r, Map<String, Object> base) {
+        if (base == null) return 0;
+        return Math.abs(asLong(r.get("distanceMeters")) - asLong(base.get("distanceMeters")))
+                + Math.abs(asLong(r.get("durationSeconds")) - asLong(base.get("durationSeconds"))) * 10
+                + Math.abs(asLong(r.get("trafficLights")) - asLong(base.get("trafficLights"))) * 100;
+    }
+
+    private static String friendlyAmapError(String raw) {
+        if (raw == null) return "路径规划失败";
+        String u = raw.toUpperCase();
+        if (u.contains("CUQPS") || u.contains("CQPS") || u.contains("EXCEEDED_THE_LIMIT") || u.contains("DAILY_QUERY")) {
+            return "地图服务请求过于频繁，请等待几秒后再点「规划路线」（免费 Key 有并发/次数限制）";
+        }
+        if (u.contains("INVALID_USER_KEY") || u.contains("USERKEY_PLAT_NOMATCH")) {
+            return "高德 Key 无效或平台不匹配，请检查 AMAP_WEB_KEY 配置";
+        }
+        return raw;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private List<Map<String, Object>> fetchAllDrivingPaths(
@@ -186,65 +270,6 @@ public class AmapTipsClient {
             if (poly != null && !poly.isEmpty()) list.add(dto);
         }
         return list;
-    }
-
-    private static Map<String, Object> firstOrBest(List<Map<String, Object>> preferred, List<Map<String, Object>> pool, boolean preferFast) {
-        if (preferred != null && !preferred.isEmpty()) return preferred.get(0);
-        if (pool == null || pool.isEmpty()) throw new IllegalStateException("无可用路径");
-        if (!preferFast) return pool.get(0);
-        Map<String, Object> best = pool.get(0);
-        for (Map<String, Object> r : pool) {
-            if (asLong(r.get("durationSeconds")) < asLong(best.get("durationSeconds"))) best = r;
-        }
-        return best;
-    }
-
-    private static Map<String, Object> pickDifferent(
-            List<Map<String, Object>> preferred,
-            List<Map<String, Object>> pool,
-            Map<String, Object> excludeA,
-            Map<String, Object> excludeB,
-            boolean preferFast) {
-        // 1) 优先用本策略结果里与已选不同的
-        if (preferred != null) {
-            Map<String, Object> best = null;
-            for (Map<String, Object> r : preferred) {
-                if (sameRoute(r, excludeA) || sameRoute(r, excludeB)) continue;
-                if (best == null) best = r;
-                else if (preferFast && asLong(r.get("durationSeconds")) < asLong(best.get("durationSeconds"))) best = r;
-                else if (!preferFast && routeDiffScore(r, excludeA) > routeDiffScore(best, excludeA)) best = r;
-            }
-            if (best != null) return best;
-            if (!preferred.isEmpty() && !sameRoute(preferred.get(0), excludeA) && !sameRoute(preferred.get(0), excludeB)) {
-                return preferred.get(0);
-            }
-        }
-        // 2) 从总池里挑差异最大 / 最快
-        Map<String, Object> best = null;
-        for (Map<String, Object> r : pool) {
-            if (sameRoute(r, excludeA) || sameRoute(r, excludeB)) continue;
-            if (best == null) {
-                best = r;
-                continue;
-            }
-            if (preferFast) {
-                if (asLong(r.get("durationSeconds")) < asLong(best.get("durationSeconds"))) best = r;
-            } else if (routeDiffScore(r, excludeA) > routeDiffScore(best, excludeA)) {
-                best = r;
-            }
-        }
-        if (best != null) return best;
-        // 3) 实在没有不同路线，退回已有（会在 UI 上仍相同，但已尽力）
-        if (preferred != null && !preferred.isEmpty()) return preferred.get(0);
-        if (excludeA != null) return excludeA;
-        return pool.get(0);
-    }
-
-    private static long routeDiffScore(Map<String, Object> r, Map<String, Object> base) {
-        if (base == null) return 0;
-        return Math.abs(asLong(r.get("distanceMeters")) - asLong(base.get("distanceMeters")))
-                + Math.abs(asLong(r.get("durationSeconds")) - asLong(base.get("durationSeconds"))) * 10
-                + Math.abs(asLong(r.get("trafficLights")) - asLong(base.get("trafficLights"))) * 100;
     }
 
     private Map<String, Object> parsePathObject(JsonObject path, String routeId, String name, int strategy) {
@@ -436,6 +461,20 @@ public class AmapTipsClient {
     }
 
     private static String httpGet(String urlStr) throws Exception {
+        // 全局限流：tips + driving 共用，避免免费 Key 触发 CUQPS
+        synchronized (AMAP_LOCK) {
+            long now = System.currentTimeMillis();
+            long wait = AMAP_MIN_INTERVAL_MS - (now - lastAmapCallAtMs);
+            if (wait > 0) {
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            lastAmapCallAtMs = System.currentTimeMillis();
+        }
+
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
