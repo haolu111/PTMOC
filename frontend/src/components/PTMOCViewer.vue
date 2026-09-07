@@ -52,21 +52,18 @@
         </div>
       </header>
 
-      <div class="toolbar">
-        <div class="toolbar-left">
-          <div class="form-row">
-            <label>起点</label>
-            <select v-model="selectedStart" disabled>
-              <option>人民广场</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <label>终点</label>
-            <select v-model="selectedEnd" @change="onEndChange">
-              <option value="">请选择终点</option>
-              <option v-for="e in endPoints" :key="e" :value="e">{{ e }}</option>
-            </select>
-          </div>
+      <div class="toolbar toolbar-goal1">
+        <div class="toolbar-left location-row">
+          <LocationSelector
+            v-model="startLocation"
+            label="起点"
+            placeholder="搜索起点，例如：华东师范大学"
+          />
+          <LocationSelector
+            v-model="endLocation"
+            label="终点"
+            placeholder="搜索终点，例如：上海虹桥站"
+          />
           <div class="form-row">
             <label>阈值 k</label>
             <select v-model.number="thresholdK">
@@ -76,16 +73,23 @@
               <option :value="5">5</option>
             </select>
           </div>
+          <button class="plan-btn" :disabled="isTraveling" @click="onPlanRoute">
+            规划路线
+          </button>
         </div>
 
-        <div class="toolbar-center" v-if="currentTrajectory">
-          <span class="category-tag" :class="'cat-' + currentTrajectory.category">
-            {{ currentTrajectory.label }}
-          </span>
-          <span class="traj-info">距离: <b>{{ currentTrajectory.distance }}km</b></span>
+        <div class="toolbar-center" v-if="planHint">
+          <span class="plan-hint" :class="planHintType">{{ planHint }}</span>
         </div>
 
-        <div class="toolbar-right">
+        <div class="toolbar-demo">
+          <div class="form-row">
+            <label>演示路线（可选）</label>
+            <select v-model="selectedEnd" @change="onEndChange">
+              <option value="">不使用预设</option>
+              <option v-for="e in endPoints" :key="e" :value="e">人民广场 → {{ e }}</option>
+            </select>
+          </div>
           <button class="verify-btn" :disabled="!canStart || isTraveling" @click="startTravel">
             {{ isTraveling ? '行程中...' : '开始行程' }}
           </button>
@@ -94,9 +98,11 @@
 
       <div class="map-full">
         <div class="map-title">
-          参考轨迹
+          地图
           <span class="map-legend">
-            <span class="legend-line legend-ref"></span>参考轨迹
+            <span class="legend-dot legend-start"></span>起点
+            <span class="legend-dot legend-end"></span>终点
+            <span class="legend-line legend-ref"></span>参考轨迹（演示）
           </span>
         </div>
         <div class="map-container" ref="mapRef"></div>
@@ -274,6 +280,8 @@ import 'leaflet/dist/leaflet.css'
 import { getEndPointsForStart, getRouteByStartEnd } from '../data/trajectoryData.js'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { verifyTrajectory, buildCryptoViewModel } from '../api/ptmocApi.js'
+import { emptyLocation, isLocationSelected } from '../api/mapApi.js'
+import LocationSelector from './map/LocationSelector.vue'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -518,6 +526,11 @@ const thresholdK = ref(3)
 const currentTrajectory = ref(null)
 const isTraveling = ref(false)
 
+const startLocation = ref(emptyLocation())
+const endLocation = ref(emptyLocation())
+const planHint = ref('')
+const planHintType = ref('info') // info | ok | warn
+
 const endPoints = computed(() => getEndPointsForStart('人民广场'))
 const canStart = computed(() => selectedEnd.value && currentTrajectory.value)
 
@@ -526,12 +539,92 @@ const mapRef = ref(null)
 const travelMapRef = ref(null)
 let mainMap = null
 let travelMap = null
+let startMarker = null
+let endMarker = null
+
+function clearEndpointMarkers() {
+  if (startMarker) { mainMap?.removeLayer(startMarker); startMarker = null }
+  if (endMarker) { mainMap?.removeLayer(endMarker); endMarker = null }
+}
+
+function refreshEndpointMarkers() {
+  if (!mainMap) return
+
+  // 若当前展示预设轨迹，由 updateMainMap 负责；此处只画自由选点
+  if (currentTrajectory.value) return
+
+  clearEndpointMarkers()
+  const boundsPts = []
+
+  // 高德 Web 服务坐标为 GCJ-02，直接用于高德瓦片，不再做 WGS84 转换
+  if (isLocationSelected(startLocation.value)) {
+    const lat = startLocation.value.lat
+    const lng = startLocation.value.lng
+    startMarker = L.marker([lat, lng], { icon: createColorIcon('#52c41a') })
+      .addTo(mainMap)
+      .bindPopup(`起点: ${startLocation.value.name}`)
+    boundsPts.push([lat, lng])
+  }
+  if (isLocationSelected(endLocation.value)) {
+    const lat = endLocation.value.lat
+    const lng = endLocation.value.lng
+    endMarker = L.marker([lat, lng], { icon: createColorIcon('#ff4d4f') })
+      .addTo(mainMap)
+      .bindPopup(`终点: ${endLocation.value.name}`)
+    boundsPts.push([lat, lng])
+  }
+
+  if (boundsPts.length === 1) {
+    mainMap.setView(boundsPts[0], 14)
+  } else if (boundsPts.length === 2) {
+    mainMap.fitBounds(L.latLngBounds(boundsPts), { padding: [60, 60] })
+  }
+}
+
+function onPlanRoute() {
+  if (!isLocationSelected(startLocation.value) || !isLocationSelected(endLocation.value)) {
+    planHintType.value = 'warn'
+    planHint.value = '请从候选列表中分别选择具体的起点和终点（仅输入文字不能规划）'
+    showAlert('warning', '请从下拉候选中选择具体 POI，不能只输入文字。')
+    return
+  }
+  // 清除演示路线，避免和自由选点混用
+  selectedEnd.value = ''
+  currentTrajectory.value = null
+  if (mainMap) {
+    mainMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) mainMap.removeLayer(l) })
+  }
+  startMarker = null
+  endMarker = null
+  refreshEndpointMarkers()
+  planHintType.value = 'ok'
+  planHint.value = `起终点已确认：${startLocation.value.name} → ${endLocation.value.name}（经纬度已取得）。动态道路规划将在目标2接入。`
+}
+
+watch(startLocation, () => {
+  if (!currentTrajectory.value) {
+    nextTick(() => refreshEndpointMarkers())
+  }
+}, { deep: true })
+
+watch(endLocation, () => {
+  if (!currentTrajectory.value) {
+    nextTick(() => refreshEndpointMarkers())
+  }
+}, { deep: true })
 
 function onEndChange() {
-  if (!selectedEnd.value) { currentTrajectory.value = null; return }
+  if (!selectedEnd.value) {
+    currentTrajectory.value = null
+    planHint.value = ''
+    nextTick(() => refreshEndpointMarkers())
+    return
+  }
   const data = getRouteByStartEnd('人民广场', selectedEnd.value)
   if (data) {
     currentTrajectory.value = data
+    planHintType.value = 'info'
+    planHint.value = `已加载演示路线：人民广场 → ${selectedEnd.value}`
     nextTick(() => updateMainMap())
   }
 }
@@ -540,13 +633,15 @@ function updateMainMap() {
   if (!mainMap || !currentTrajectory.value) return
   mainMap.invalidateSize()
   mainMap.eachLayer(l => { if (!(l instanceof L.TileLayer)) mainMap.removeLayer(l) })
+  startMarker = null
+  endMarker = null
 
   const refPts = convertPts(currentTrajectory.value.referenceTrajectory)
   const refLatLngs = refPts.map(p => [p.lat, p.lng])
   L.polyline(refLatLngs, { color: REF_COLOR, weight: 3, opacity: 0.7, dashArray: '10, 7' }).addTo(mainMap)
 
-  L.marker(refLatLngs[0], { icon: createColorIcon('#52c41a') }).addTo(mainMap).bindPopup('起点: 人民广场')
-  L.marker(refLatLngs[refLatLngs.length - 1], { icon: createColorIcon('#ff4d4f') }).addTo(mainMap).bindPopup('终点: ' + currentTrajectory.value.end)
+  startMarker = L.marker(refLatLngs[0], { icon: createColorIcon('#52c41a') }).addTo(mainMap).bindPopup('起点: 人民广场')
+  endMarker = L.marker(refLatLngs[refLatLngs.length - 1], { icon: createColorIcon('#ff4d4f') }).addTo(mainMap).bindPopup('终点: ' + currentTrajectory.value.end)
 
   mainMap.fitBounds(L.latLngBounds(refLatLngs), { padding: [50, 50] })
 }
@@ -559,6 +654,7 @@ function initMainMap() {
       if (mainMap) {
         mainMap.invalidateSize()
         if (currentTrajectory.value) updateMainMap()
+        else refreshEndpointMarkers()
       }
     }, 200)
   }
@@ -1138,6 +1234,7 @@ watch(currentPage, (val) => {
         setTimeout(() => {
           mainMap.invalidateSize()
           if (currentTrajectory.value) updateMainMap()
+          else refreshEndpointMarkers()
         }, 100)
       }
     })
@@ -1245,8 +1342,51 @@ watch(currentPage, (val) => {
   gap: 20px;
   box-shadow: 0 1px 4px rgba(0,0,0,0.08);
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
-.toolbar-left { display: flex; gap: 12px; align-items: flex-end; }
+.toolbar-goal1 {
+  align-items: flex-start;
+}
+.toolbar-left { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.toolbar-demo {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  margin-left: auto;
+  padding-left: 12px;
+  border-left: 1px solid #f0f0f0;
+}
+.plan-btn {
+  height: 32px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 4px;
+  background: #13c2c2;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.plan-btn:hover:not(:disabled) { background: #08979c; }
+.plan-btn:disabled { background: #d9d9d9; cursor: not-allowed; }
+.plan-hint {
+  font-size: 12px;
+  max-width: 420px;
+  line-height: 1.4;
+}
+.plan-hint.info { color: #595959; }
+.plan-hint.ok { color: #389e0d; }
+.plan-hint.warn { color: #cf1322; }
+.legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin: 0 4px 0 8px;
+  vertical-align: middle;
+}
+.legend-dot.legend-start { background: #52c41a; }
+.legend-dot.legend-end { background: #ff4d4f; }
 .form-row { display: flex; flex-direction: column; gap: 2px; }
 .form-row label { font-size: 11px; color: #999; font-weight: 500; }
 .form-row select {

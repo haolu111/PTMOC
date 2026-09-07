@@ -23,3 +23,7 @@ node_modules/
 dist/
 build/
 .tools/
+application-local.yml
+.env
+.env.*
+!.env.example

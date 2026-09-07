@@ -1,2 +1,12 @@
 server:
   port: 8080
+
+spring:
+  # 默认启用 local，自动加载 application-local.yml（该文件已 gitignore）
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+
+amap:
+  # 优先用环境变量；local 配置里也会覆盖/提供 key
+  # 真实 Key 写在 application-local.yml，不要写进本文件
+  key: ${AMAP_WEB_KEY:}
