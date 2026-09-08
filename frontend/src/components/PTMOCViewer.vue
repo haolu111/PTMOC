@@ -145,6 +145,13 @@
               <span class="legend-line legend-user"></span>用户轨迹
             </span>
           </div>
+          <div class="spatial-notice" v-if="spatialNotice" role="alert">
+            <span>
+              <strong>路线偏移提醒</strong>
+              已检测到偏离参考路线
+            </span>
+            <button type="button" aria-label="关闭路线偏移提醒" @click="spatialNotice = null">×</button>
+          </div>
           <div class="map-container" ref="travelMapRef"></div>
         </div>
 
@@ -255,6 +262,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { buildScenarioTrajectory, scenarioOptions } from '../data/trajectoryScenario.js'
+import { buildTraveledTrajectory, distanceToRouteMeters, SPATIAL_ALERT_THRESHOLD_METERS } from '../utils/routeDeviation.js'
 import { verifyTrajectory, buildCryptoViewModel, buildSyntheticProcessTrace } from '../api/ptmocApi.js'
 import { emptyLocation, isLocationSelected, planRoutes } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
@@ -736,6 +744,7 @@ function initMainMap() {
 
 // ========== 行程页状态 ==========
 const travelTimer = ref(0) // 模拟分钟数（1真实秒=1模拟分钟）
+const spatialNotice = ref(null)
 const showCryptoProcess = ref(false)
 const cryptoSteps = ref([])
 const cryptoProcessTrace = ref([])
@@ -938,6 +947,7 @@ function startTravel() {
   isTraveling.value = true
   currentPage.value = 'travel'
   travelTimer.value = 0
+  spatialNotice.value = null
   showCryptoProcess.value = false
   cryptoSteps.value = []
   cryptoProcessTrace.value = []
@@ -995,6 +1005,8 @@ function startPathAnimation() {
   const coordSystem = currentTrajectory.value.coordSystem || 'wgs84'
   // 动画始终跟随「用户轨迹」（场景生成器已写入正常/偏移路径）
   const displayPts = convertPts(currentTrajectory.value.userTrajectory, coordSystem)
+  const referencePts = convertPts(currentTrajectory.value.referenceTrajectory, coordSystem)
+  let spatialAlertShown = false
 
   const totalDisplayPoints = displayPts.length
 
@@ -1032,10 +1044,10 @@ function startPathAnimation() {
   let animFinished = false
 
   function getPositionAtDist(dist) {
-    if (dist <= 0) return { lat: displayPts[0].lat, lng: displayPts[0].lng, segIdx: 0 }
+    if (dist <= 0) return { lat: displayPts[0].lat, lng: displayPts[0].lng, segIdx: 0, fraction: 0 }
     if (dist >= totalDist) {
       const last = displayPts[displayPts.length - 1]
-      return { lat: last.lat, lng: last.lng, segIdx: Math.max(0, displayPts.length - 2) }
+      return { lat: last.lat, lng: last.lng, segIdx: Math.max(0, displayPts.length - 2), fraction: 1 }
     }
     let segIdx = 0
     for (let i = 1; i < cumDistances.length; i++) {
@@ -1049,7 +1061,8 @@ function startPathAnimation() {
     return {
       lat: p1.lat + (p2.lat - p1.lat) * t,
       lng: p1.lng + (p2.lng - p1.lng) * t,
-      segIdx
+      segIdx,
+      fraction: t
     }
   }
 
@@ -1113,16 +1126,27 @@ function startPathAnimation() {
       return
     }
 
-    if (category === 'spatial' && currentDist >= totalDist) {
-      animFinished = true
-      setTimeout(() => {
-        travelAlertFired = true
+    if (category === 'spatial') {
+      if (!spatialAlertShown && referencePts.length >= 2) {
+        const deviationMeters = distanceToRouteMeters(pos, referencePts)
+        if (deviationMeters > SPATIAL_ALERT_THRESHOLD_METERS) {
+          spatialAlertShown = true
+          spatialNotice.value = { distanceMeters: Math.round(deviationMeters) }
+          const traveled = buildTraveledTrajectory(currentTrajectory.value, pos.segIdx, pos.fraction)
+          showCryptoProcess.value = true
+          // 异步验证截至告警时刻的轨迹，不等待结果、不暂停动画。
+          void animateCryptoProcess(traveled)
+        }
+      }
+
+      if (currentDist >= totalDist) {
+        animFinished = true
         clearInterval(travelTimerInterval)
         travelTimerInterval = null
         isTraveling.value = false
-        showAlert('warning', '路线偏移！检测到行驶路线与参考轨迹不一致，已触发PTMOC验证。')
-      }, 1500)
-      return
+        // 已在超阈值时触发验证，终点只结束行程。
+        return
+      }
     }
 
     if (category === 'pass' && currentDist >= totalDist) {
@@ -1167,13 +1191,13 @@ function onCryptoFlowComplete() {
   // Trace 播完后结果已在面板内展示；此处保留钩子便于后续扩展
 }
 
-function buildOfflineViewModel() {
-  const isPass = currentTrajectory.value?.category === 'pass'
+function buildOfflineViewModel(traj = currentTrajectory.value) {
+  const isPass = traj?.category === 'pass'
   const dataSource = isPass ? CRYPTO_DATA : CRYPTO_DATA_ABNORMAL
   const finalResult = isPass ? 1 : 0
   dataSource.steps[5].data[2].value = finalResult.toString()
 
-  const category = currentTrajectory.value?.category
+  const category = traj?.category
   const reasonCodes = category === 'time'
     ? ['TIME_DEVIATION']
     : category === 'spatial'
@@ -1196,7 +1220,7 @@ function buildOfflineViewModel() {
       verificationStatus: status,
       score: isPass ? 100 : 40,
       reasonCodes,
-      anomalyDesc: currentTrajectory.value?.anomalyDesc || null
+      anomalyDesc: traj?.anomalyDesc || null
     }),
     finalResult,
     verificationStatus: status,
@@ -1206,8 +1230,8 @@ function buildOfflineViewModel() {
   }
 }
 
-async function animateCryptoProcess() {
-  const traj = currentTrajectory.value
+async function animateCryptoProcess(traj = currentTrajectory.value) {
+  const sourceTrajectory = currentTrajectory.value
   if (!traj) {
     playCryptoViewModel(buildOfflineViewModel())
     return
@@ -1231,10 +1255,12 @@ async function animateCryptoProcess() {
       timeAnomaly: !!traj.timeAnomaly,
       anomalyDesc: traj.anomalyDesc || null
     })
+    if (currentTrajectory.value !== sourceTrajectory) return
     playCryptoViewModel(buildCryptoViewModel(response))
   } catch (err) {
+    if (currentTrajectory.value !== sourceTrajectory) return
     console.warn('[PTMOC] backend unavailable, using offline CRYPTO_DATA:', err)
-    const offline = buildOfflineViewModel()
+    const offline = buildOfflineViewModel(traj)
     offline.key = `离线兜底（后端不可用: ${err?.message || err}）`
     playCryptoViewModel(offline)
   }
@@ -1520,6 +1546,28 @@ watch(currentPage, (val) => {
 /* ============ 行程页 ============ */
 .page-travel { display: flex; flex-direction: column; height: 100vh; }
 .travel-header { flex-shrink: 0; }
+.spatial-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #fff7e6;
+  color: #874d00;
+  border-bottom: 1px solid #ffd591;
+  font-size: 13px;
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+.spatial-notice strong { display: block; }
+.spatial-notice button {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 22px;
+  padding: 0 4px;
+}
 .back-btn {
   padding: 5px 12px;
   background: rgba(255,255,255,0.15);
