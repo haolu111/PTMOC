@@ -91,8 +91,8 @@
               </option>
             </select>
           </div>
-          <button class="verify-btn" :disabled="!canStart || isTraveling" @click="startTravel">
-            {{ isTraveling ? '行程中...' : '开始行程' }}
+          <button class="verify-btn" :disabled="!canStart || isTraveling || preparingTravel" @click="startTravel">
+            {{ preparingTravel ? '生成绕路中...' : (isTraveling ? '行程中...' : '开始行程') }}
           </button>
         </div>
       </div>
@@ -142,7 +142,8 @@
             实时行程
             <span class="map-legend">
               <span class="legend-line legend-ref"></span>参考轨迹
-              <span class="legend-line legend-user"></span>用户轨迹
+              <span class="legend-line legend-user"></span>用户实际轨迹
+              <span class="legend-line legend-alt"></span>绕路预览
             </span>
           </div>
           <div class="spatial-notice" v-if="spatialNotice" role="alert">
@@ -264,7 +265,7 @@ import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { buildScenarioTrajectory, scenarioOptions } from '../data/trajectoryScenario.js'
 import { buildTraveledTrajectory, distanceToRouteMeters, SPATIAL_ALERT_THRESHOLD_METERS } from '../utils/routeDeviation.js'
 import { verifyTrajectory, buildCryptoViewModel, buildSyntheticProcessTrace } from '../api/ptmocApi.js'
-import { emptyLocation, isLocationSelected, planRoutes } from '../api/mapApi.js'
+import { emptyLocation, isLocationSelected, planRoutes, planDetourRoute } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
 import RoutePlanList from './map/RoutePlanList.vue'
 import CryptoFlowPanel from './crypto/CryptoFlowPanel.vue'
@@ -527,9 +528,10 @@ const selectedPlannedRoute = ref(null)
 const planningLoading = ref(false)
 const travelScenario = ref('pass')
 const scenarioSelectOptions = scenarioOptions()
+const preparingTravel = ref(false)
 
 const canStart = computed(() => {
-  if (isTraveling.value) return false
+  if (isTraveling.value || preparingTravel.value) return false
   return !!(selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2)
 })
 
@@ -908,32 +910,70 @@ function formatTimer(minutes) {
 }
 
 // ========== 开始行程 ==========
-function prepareTrajectoryForTravel() {
-  if (selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2) {
-    const route = selectedPlannedRoute.value
-    return buildScenarioTrajectory({
-      referencePoints: route.polyline,
-      startName: startLocation.value?.name || '起点',
-      endName: endLocation.value?.name || '终点',
-      durationSeconds: route.durationSeconds,
-      scenario: travelScenario.value,
-      coordSystem: 'gcj02',
-      sourceRouteId: route.routeId
-    })
+async function prepareTrajectoryForTravel() {
+  if (!(selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2)) {
+    throw new Error('请先规划并选择一条参考路线')
   }
 
-  throw new Error('请先规划并选择一条参考路线')
+  const route = selectedPlannedRoute.value
+  const baseOpts = {
+    referencePoints: route.polyline,
+    startName: startLocation.value?.name || '起点',
+    endName: endLocation.value?.name || '终点',
+    durationSeconds: route.durationSeconds,
+    scenario: travelScenario.value,
+    coordSystem: 'gcj02',
+    sourceRouteId: route.routeId
+  }
+
+  if (travelScenario.value !== 'spatial') {
+    return buildScenarioTrajectory(baseOpts)
+  }
+
+  // 空间异常：走真实道路绕路（备选策略路线，或途经点二次规划）
+  planHintType.value = 'info'
+  planHint.value = '正在生成真实道路绕路（优先用备选路线，必要时途经点绕路）...'
+
+  const detour = await planDetourRoute({
+    origin: { lng: startLocation.value.lng, lat: startLocation.value.lat },
+    destination: { lng: endLocation.value.lng, lat: endLocation.value.lat },
+    referencePolyline: route.polyline,
+    candidateRoutes: plannedRoutes.value,
+    selectedRouteId: selectedRouteId.value
+  })
+
+  const sourceHint = detour.source === 'candidate'
+    ? `选用已规划的「${detour.name}」`
+    : '经旁路途经点重新规划'
+  const detourDesc =
+    `用户实际${sourceHint}绕行，未沿参考路线行驶（最大偏离约 ${Math.round(detour.maxDeviation)} m）`
+
+  planHintType.value = 'ok'
+  planHint.value = `空间异常已就绪：${sourceHint}，最大偏离约 ${Math.round(detour.maxDeviation)} m`
+
+  return buildScenarioTrajectory({
+    ...baseOpts,
+    detourPoints: detour.polyline,
+    detourDesc,
+    detourDurationSeconds: detour.durationSeconds,
+    detourRouteId: detour.routeId,
+    detourName: detour.name
+  })
 }
 
-function startTravel() {
-  if (!canStart.value || isTraveling.value) return
+async function startTravel() {
+  if (!canStart.value || isTraveling.value || preparingTravel.value) return
 
+  preparingTravel.value = true
   let traj
   try {
-    traj = prepareTrajectoryForTravel()
+    traj = await prepareTrajectoryForTravel()
   } catch (err) {
-    showAlert('warning', err?.message || '无法生成行程轨迹')
+    showAlert('warning', formatPlanError(err?.message) || '无法生成行程轨迹')
+    preparingTravel.value = false
     return
+  } finally {
+    preparingTravel.value = false
   }
   currentTrajectory.value = traj
 
@@ -987,16 +1027,38 @@ function initTravelMap() {
     const refLatLngs = refPts.map(p => [p.lat, p.lng])
     L.polyline(refLatLngs, { color: REF_COLOR, weight: 3, opacity: 0.5, dashArray: '10, 7' }).addTo(travelMap)
 
+    // 空间异常时预先淡显完整绕路，方便评委一眼看出「走的是另一条路」
+    const userFull = convertPts(
+      currentTrajectory.value.userTrajectory,
+      currentTrajectory.value.coordSystem
+    )
+    const userFullLatLngs = userFull.map(p => [p.lat, p.lng])
+    if (
+      currentTrajectory.value.category === 'spatial' &&
+      userFullLatLngs.length >= 2
+    ) {
+      L.polyline(userFullLatLngs, {
+        color: USER_COLOR,
+        weight: 3,
+        opacity: 0.28,
+        dashArray: '2, 8'
+      }).addTo(travelMap).bindPopup(currentTrajectory.value.detourName
+        ? `实际绕路：${currentTrajectory.value.detourName}`
+        : '实际绕路预览')
+    }
+
     L.marker(refLatLngs[0], { icon: createColorIcon('#52c41a') }).addTo(travelMap).bindPopup('起点')
     L.marker(refLatLngs[refLatLngs.length - 1], { icon: createColorIcon('#ff4d4f') }).addTo(travelMap).bindPopup('终点')
 
     // 用户轨迹 - 空的，会逐步添加
     userPolyline = L.polyline([], { color: USER_COLOR, weight: 4, opacity: 0.9 }).addTo(travelMap)
 
-    // 小车标记 - 初始在起点
-    carMarker = L.marker(refLatLngs[0], { icon: createCarIcon(), zIndexOffset: 1000 }).addTo(travelMap)
+    // 小车标记 - 初始在起点（用户轨迹起点）
+    const carStart = userFullLatLngs[0] || refLatLngs[0]
+    carMarker = L.marker(carStart, { icon: createCarIcon(), zIndexOffset: 1000 }).addTo(travelMap)
 
-    travelMap.fitBounds(L.latLngBounds(refLatLngs), { padding: [50, 50] })
+    const fitPts = refLatLngs.concat(userFullLatLngs)
+    travelMap.fitBounds(L.latLngBounds(fitPts), { padding: [50, 50] })
   }
 }
 

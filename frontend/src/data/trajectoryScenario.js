@@ -1,13 +1,18 @@
 /**
  * 根据参考路线 + 场景下拉，动态生成 User / Reference 轨迹。
- * 供「开始行程」使用；不依赖预置 ROUTE_COORDS。
+ * 空间异常必须使用「真实道路绕路」（备选规划路线 / 途经点绕路），禁止法向平移假路径。
  */
+
+import { distanceToRouteMeters } from '../utils/routeDeviation.js'
 
 const SCENARIO_META = {
   pass: { category: 'pass', label: '准确无误', timeAnomaly: false },
-  spatial: { category: 'spatial', label: '路线偏移', timeAnomaly: false },
+  spatial: { category: 'spatial', label: '空间异常', timeAnomaly: false },
   time: { category: 'time', label: '时间异常', timeAnomaly: true }
 }
+
+/** 认定「明显绕路」的最小最大偏离（米） */
+export const MIN_DETOUR_MAX_DEV_METERS = 180
 
 /**
  * @param {object} opts
@@ -18,6 +23,9 @@ const SCENARIO_META = {
  * @param {'pass'|'spatial'|'time'} opts.scenario
  * @param {'gcj02'|'wgs84'} [opts.coordSystem='gcj02']
  * @param {number} [opts.maxPoints=90] 下采样上限，减轻 PTMOC 输入规模
+ * @param {Array<{lat:number,lng:number}>} [opts.detourPoints] 空间异常：真实绕路折线
+ * @param {string} [opts.detourDesc] 绕路说明
+ * @param {number} [opts.detourDurationSeconds] 绕路耗时（秒），缺省用参考耗时
  */
 export function buildScenarioTrajectory(opts) {
   const scenario = opts.scenario || 'pass'
@@ -42,16 +50,28 @@ export function buildScenarioTrajectory(opts) {
   let forkIndex = -1
 
   if (scenario === 'spatial') {
-    const built = buildSpatialUserPath(sampled)
-    forkIndex = built.forkIndex
-    userTrajectory = attachTimestamps(built.points, baseTime, durationMinutes)
-    anomalyDesc = '用户轨迹在中段偏离参考路线，空间偏移过大'
+    const detourRaw = (opts.detourPoints || []).filter(
+      (p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng)
+    )
+    if (detourRaw.length < 2) {
+      throw new Error('空间异常需要真实绕路轨迹（请先规划路线，系统会选用备选道路或途经点绕路）')
+    }
+    const detourSampled = downsamplePoints(detourRaw, maxPoints)
+    const detourMinutes = Math.max(
+      durationMinutes,
+      (Number(opts.detourDurationSeconds) || estimateDurationSeconds(detourSampled)) / 60
+    )
+    userTrajectory = attachTimestamps(detourSampled, baseTime, detourMinutes)
+    forkIndex = findForkIndex(sampled, detourSampled)
+    const stats = measurePathDeviation(detourSampled, sampled)
+    anomalyDesc =
+      opts.detourDesc ||
+      `用户未按参考路线行驶，而是走了另一条真实道路绕路（最大偏离约 ${Math.round(stats.max)} m）`
   } else if (scenario === 'time') {
     const timeFactor = 2.0
     userTrajectory = attachTimestamps(sampled, baseTime, durationMinutes * timeFactor)
     anomalyDesc = `用户行驶耗时约为参考路线的 ${timeFactor.toFixed(1)} 倍，存在显著时间偏差`
   } else {
-    // 正常：可选轻微噪声，默认与参考一致以保证 PASS 稳定
     userTrajectory = referenceTrajectory.map((p) => ({ ...p }))
     anomalyDesc = null
   }
@@ -68,7 +88,9 @@ export function buildScenarioTrajectory(opts) {
     coordSystem: opts.coordSystem || 'gcj02',
     dynamic: true,
     forkIndex,
-    sourceRouteId: opts.sourceRouteId || null
+    sourceRouteId: opts.sourceRouteId || null,
+    detourRouteId: opts.detourRouteId || null,
+    detourName: opts.detourName || null
   }
 }
 
@@ -78,6 +100,121 @@ export function scenarioOptions() {
     { value: 'spatial', label: '空间异常' },
     { value: 'time', label: '时间异常' }
   ]
+}
+
+/**
+ * 从已规划的多条路线中，挑一条与参考路线差异最大、且像真实绕路的备选。
+ * @returns {{ polyline, routeId, name, durationSeconds, distanceMeters, avgDeviation, maxDeviation } | null}
+ */
+export function pickDetourFromCandidates(referencePoints, candidateRoutes, selectedRouteId) {
+  const ref = (referencePoints || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng))
+  if (ref.length < 2 || !Array.isArray(candidateRoutes)) return null
+
+  let best = null
+  for (const route of candidateRoutes) {
+    if (!route || route.routeId === selectedRouteId) continue
+    const poly = (route.polyline || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng))
+    if (poly.length < 2) continue
+    const stats = measurePathDeviation(poly, ref)
+    if (stats.max < MIN_DETOUR_MAX_DEV_METERS) continue
+    if (!best || stats.max > best.maxDeviation || (stats.max === best.maxDeviation && stats.avg > best.avgDeviation)) {
+      best = {
+        polyline: poly,
+        routeId: route.routeId,
+        name: route.name || '备选路线',
+        durationSeconds: route.durationSeconds,
+        distanceMeters: route.distanceMeters,
+        avgDeviation: stats.avg,
+        maxDeviation: stats.max
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * 在参考路线中段附近生成一个「旁路途经点」，用于二次规划真实绕路。
+ * 优先尝试左右法向；返回若干候选点供调用方依次试探。
+ */
+export function buildDetourWaypointCandidates(referencePoints, offsetMeters = 1400) {
+  const pts = (referencePoints || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng))
+  if (pts.length < 2) return []
+
+  const ratios = [0.35, 0.5, 0.65]
+  const offsets = [offsetMeters, offsetMeters * 0.75, offsetMeters * 1.35]
+  const candidates = []
+
+  for (const ratio of ratios) {
+    const idx = Math.max(1, Math.min(pts.length - 2, Math.floor(pts.length * ratio)))
+    const a = pts[idx]
+    const b = pts[Math.min(idx + 1, pts.length - 1)]
+    let dx = b.lng - a.lng
+    let dy = b.lat - a.lat
+    const len = Math.sqrt(dx * dx + dy * dy) || 1e-9
+    dx /= len
+    dy /= len
+    // 左右法向
+    const normals = [
+      { nx: -dy, ny: dx },
+      { nx: dy, ny: -dx }
+    ]
+    for (const meters of offsets) {
+      for (const { nx, ny } of normals) {
+        const dLat = (meters * ny) / 111000
+        const dLng = (meters * nx) / (111000 * Math.cos((a.lat * Math.PI) / 180) || 1e-6)
+        candidates.push({
+          lat: a.lat + dLat,
+          lng: a.lng + dLng,
+          label: `途经绕路点(~${Math.round(meters)}m)`
+        })
+      }
+    }
+  }
+  return candidates
+}
+
+/** 抽样测量 path 相对 reference 的平均/最大偏离（米） */
+export function measurePathDeviation(pathPoints, referencePoints) {
+  const path = pathPoints || []
+  const ref = referencePoints || []
+  if (!path.length || !ref.length) return { avg: 0, max: 0 }
+  const step = Math.max(1, Math.floor(path.length / 24))
+  let sum = 0
+  let max = 0
+  let count = 0
+  for (let i = 0; i < path.length; i += step) {
+    const d = distanceToRouteMeters(path[i], ref)
+    if (!Number.isFinite(d)) continue
+    sum += d
+    max = Math.max(max, d)
+    count++
+  }
+  // 再测中点附近加密一点，避免漏掉最大偏出段
+  const mid = path[Math.floor(path.length / 2)]
+  if (mid) {
+    const d = distanceToRouteMeters(mid, ref)
+    if (Number.isFinite(d)) {
+      sum += d
+      max = Math.max(max, d)
+      count++
+    }
+  }
+  return { avg: count ? sum / count : 0, max }
+}
+
+function findForkIndex(refPoints, detourPoints) {
+  const n = Math.min(refPoints.length, detourPoints.length)
+  for (let i = 0; i < n; i++) {
+    const d = haversineMeters(refPoints[i], detourPoints[Math.min(i, detourPoints.length - 1)])
+    if (d > 80) return Math.max(0, i - 1)
+  }
+  // 长度不同时，用偏离参考线的第一个点
+  for (let i = 0; i < detourPoints.length; i++) {
+    if (distanceToRouteMeters(detourPoints[i], refPoints) > 80) {
+      return Math.max(0, Math.floor((i / detourPoints.length) * refPoints.length) - 1)
+    }
+  }
+  return Math.floor(refPoints.length * 0.25)
 }
 
 function downsamplePoints(points, maxPoints) {
@@ -113,7 +250,6 @@ function estimateDurationSeconds(points) {
   for (let i = 1; i < points.length; i++) {
     meters += haversineMeters(points[i - 1], points[i])
   }
-  // 约 30 km/h
   return Math.max(300, (meters / 1000) * 120)
 }
 
@@ -128,43 +264,4 @@ function haversineMeters(a, b) {
     Math.sin(dLat / 2) ** 2 +
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)))
-}
-
-/**
- * 中段法向偏移：平滑偏出、持续偏离、平滑回归；首尾贴合参考路线。
- */
-function buildSpatialUserPath(refPoints) {
-  const n = refPoints.length
-  const startIdx = Math.max(1, Math.floor(n * 0.2))
-  const endIdx = Math.min(n - 2, Math.floor(n * 0.85))
-  const offsetMeters = 500
-  const transitionRatio = 0.25 // 偏移区间前后各 25% 用于过渡，中间 50% 保持最大偏移
-
-  // 偏移方向：取中段切线的法向
-  const a = refPoints[startIdx]
-  const b = refPoints[Math.min(startIdx + 1, n - 1)]
-  let dx = b.lng - a.lng
-  let dy = b.lat - a.lat
-  const len = Math.sqrt(dx * dx + dy * dy) || 1e-9
-  dx /= len
-  dy /= len
-  // 法向 (-dy, dx)
-  const nx = -dy
-  const ny = dx
-
-  const points = refPoints.map((p, i) => {
-    if (i < startIdx || i > endIdx) {
-      return { lat: p.lat, lng: p.lng }
-    }
-    // 平滑抬升到最大偏移，保持一段后再平滑回归
-    const t = (i - startIdx) / Math.max(1, endIdx - startIdx)
-    const ramp = Math.min(1, t / transitionRatio, (1 - t) / transitionRatio)
-    const envelope = ramp * ramp * (3 - 2 * ramp)
-    const meters = offsetMeters * envelope
-    const dLat = (meters * ny) / 111000
-    const dLng = (meters * nx) / (111000 * Math.cos((p.lat * Math.PI) / 180) || 1e-6)
-    return { lat: p.lat + dLat, lng: p.lng + dLng }
-  })
-
-  return { points, forkIndex: startIdx }
 }

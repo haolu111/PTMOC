@@ -2,6 +2,13 @@
  * 地图相关 API（经后端代理，浏览器不会看到高德 Key）
  */
 
+import {
+  pickDetourFromCandidates,
+  buildDetourWaypointCandidates,
+  measurePathDeviation,
+  MIN_DETOUR_MAX_DEV_METERS
+} from '../data/trajectoryScenario.js'
+
 const DEFAULT_BASE = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_PTMOC_API_BASE) || ''
 
 function apiUrl(path) {
@@ -88,4 +95,79 @@ export async function planRoutes(origin, destination, timeoutMs = 20000) {
   } finally {
     clearTimeout(timer)
   }
+}
+
+/**
+ * 生成贴合真实道路的绕路轨迹：
+ * 1) 优先用已规划的其他策略路线（躲避拥堵 / 速度最快）
+ * 2) 若差异不够，则用中段旁路途经点：起点→途经点→终点 两次规划后拼接
+ *
+ * @returns {Promise<{
+ *   polyline: Array<{lat:number,lng:number}>,
+ *   routeId: string,
+ *   name: string,
+ *   durationSeconds: number,
+ *   distanceMeters: number,
+ *   avgDeviation: number,
+ *   maxDeviation: number,
+ *   source: 'candidate'|'waypoint'
+ * }>}
+ */
+export async function planDetourRoute(opts) {
+  const {
+    origin,
+    destination,
+    referencePolyline,
+    candidateRoutes = [],
+    selectedRouteId = ''
+  } = opts || {}
+
+  const fromCandidates = pickDetourFromCandidates(referencePolyline, candidateRoutes, selectedRouteId)
+  if (fromCandidates) {
+    return { ...fromCandidates, source: 'candidate' }
+  }
+
+  const waypoints = buildDetourWaypointCandidates(referencePolyline)
+  let lastError = null
+  for (const wp of waypoints.slice(0, 6)) {
+    try {
+      const leg1List = await planRoutes(origin, wp)
+      const leg2List = await planRoutes(wp, destination)
+      const leg1 = leg1List?.[0]
+      const leg2 = leg2List?.[0]
+      const p1 = (leg1?.polyline || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng))
+      const p2 = (leg2?.polyline || []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng))
+      if (p1.length < 2 || p2.length < 2) continue
+
+      // 去掉接缝重复点
+      const stitched = p1.concat(p2.slice(1))
+      const stats = measurePathDeviation(stitched, referencePolyline)
+      if (stats.max < MIN_DETOUR_MAX_DEV_METERS) continue
+
+      const distanceMeters =
+        (Number(leg1.distanceMeters) || 0) + (Number(leg2.distanceMeters) || 0)
+      const durationSeconds =
+        (Number(leg1.durationSeconds) || 0) + (Number(leg2.durationSeconds) || 0)
+
+      return {
+        polyline: stitched,
+        routeId: 'route-waypoint-detour',
+        name: '途经点绕路',
+        durationSeconds,
+        distanceMeters,
+        avgDeviation: stats.avg,
+        maxDeviation: stats.max,
+        source: 'waypoint'
+      }
+    } catch (err) {
+      lastError = err
+      // 免费 Key 限流时稍等再试下一个途经点
+      await new Promise((r) => setTimeout(r, 400))
+    }
+  }
+
+  throw new Error(
+    lastError?.message ||
+      '未能规划出与参考路线明显不同的真实绕路，请换一组起终点或稍后再试'
+  )
 }
