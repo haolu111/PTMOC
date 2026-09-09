@@ -1608,14 +1608,6 @@ watch(currentPage, (val) => {
   gap: 12px;
 }
 
-/* PTMOC 密码流程（组件自带样式，此处仅容器） */
-.crypto-section {
-  background: transparent;
-  border: none;
-  border-radius: 0;
-  padding: 0;
-}
-
 /* 计时器 */
 .timer-section {
   text-align: center;
@@ -1628,12 +1620,14 @@ watch(currentPage, (val) => {
 .timer-display { font-size: 36px; font-weight: 700; font-family: monospace; letter-spacing: 2px; }
 .timer-hint { font-size: 10px; opacity: 0.5; margin-top: 4px; }
 
-/* PTMOC加密过程 */
+/* PTMOC 密码流程：样式由 CryptoFlowPanel 自带 */
 .crypto-section {
-  background: #fafafa;
-  border-radius: 8px;
-  padding: 14px;
-  border: 1px solid #f0f0f0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  flex: 1;
+  min-height: 0;
 }
 .crypto-mode-badge {
   display: inline-block;
