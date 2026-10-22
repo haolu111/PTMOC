@@ -12,7 +12,7 @@ import java.util.*;
 @Service
 public class TrajectoryVerifier {
 
-    private static final double SPATIAL_THRESHOLD = 50;   // 米
+    private static final double SPATIAL_THRESHOLD = 200;  // 与前端路线距离告警一致，单位为米
     private static final double TIME_THRESHOLD_MIN = 5;    // 分钟
 
     public VerificationResult verify(
@@ -33,9 +33,7 @@ public class TrajectoryVerifier {
         int segmentStart = -1;
 
         for (int i = 0; i < numPoints; i++) {
-            double latDiff = userTrajectory.get(i).getLat() - referenceTrajectory.get(i).getLat();
-            double lngDiff = userTrajectory.get(i).getLng() - referenceTrajectory.get(i).getLng();
-            double distance = Math.sqrt(latDiff * latDiff + lngDiff * lngDiff) * 111000;
+            double distance = distanceToRoute(userTrajectory.get(i), referenceTrajectory);
             deviations.add(Math.round(distance * 100.0) / 100.0);
 
             boolean isAbnormal = distance > SPATIAL_THRESHOLD;
@@ -158,23 +156,21 @@ public class TrajectoryVerifier {
         double score = Math.round((spatialScore + timeScore) * 10.0) / 10.0;
 
         String verificationStatus;
-        if (score >= 80) verificationStatus = "通过";
+        if (!spatialAbnormalPoints.isEmpty() || !timeAbnormalPoints.isEmpty()) verificationStatus = "不通过";
+        else if (score >= 80) verificationStatus = "通过";
         else if (score >= 60) verificationStatus = "部分通过";
         else verificationStatus = "不通过";
 
         // 原因
         List<String> reasonCodes = new ArrayList<>();
         List<String> reasonDetails = new ArrayList<>();
-        if (spatialAbnormalRatio > 0.3) {
+        if (!spatialAbnormalPoints.isEmpty()) {
             reasonCodes.add("DEVIATION_TOO_LARGE");
             reasonDetails.add("空间/时间偏移过大");
         }
-        if (timeAbnormalRatio > 0.2) {
+        if (!timeAbnormalPoints.isEmpty()) {
             reasonCodes.add("TIME_DEVIATION");
             reasonDetails.add("空间/时间偏移过大：" + (anomalyDesc != null ? anomalyDesc : String.format("平均时间偏差%.1f分钟", avgTimeDeviation)));
-        }
-        if (spatialAbnormalRatio > 0.1 && spatialAbnormalRatio <= 0.3) {
-            reasonCodes.add("PARTIAL_DEVIATION");
         }
         if (reasonCodes.isEmpty() && score < 80) {
             reasonCodes.add("PARTIAL_DEVIATION");
@@ -191,6 +187,8 @@ public class TrajectoryVerifier {
         metrics.put("totalPoints", numPoints);
         metrics.put("spatialAbnormalCount", spatialAbnormalPoints.size());
         metrics.put("timeAbnormalCount", timeAbnormalPoints.size());
+        metrics.put("spatialThresholdMeters", SPATIAL_THRESHOLD);
+        metrics.put("timeThresholdMinutes", TIME_THRESHOLD_MIN);
 
         VerificationResult result = new VerificationResult();
         result.verificationStatus = verificationStatus;
@@ -205,6 +203,25 @@ public class TrajectoryVerifier {
         result.anomalyDesc = anomalyDesc;
         result.metrics = metrics;
         return result;
+    }
+
+    private static double distanceToRoute(TrajectoryPointDto position, List<TrajectoryPointDto> route) {
+        double latScale = 6371000 * Math.PI / 180;
+        double lngScale = latScale * Math.cos(Math.toRadians(position.getLat()));
+        double ax = (route.get(0).getLng() - position.getLng()) * lngScale;
+        double ay = (route.get(0).getLat() - position.getLat()) * latScale;
+        double shortest = Math.hypot(ax, ay);
+        for (int j = 1; j < route.size(); j++) {
+            double bx = (route.get(j).getLng() - position.getLng()) * lngScale;
+            double by = (route.get(j).getLat() - position.getLat()) * latScale;
+            double dx = bx - ax, dy = by - ay;
+            double lengthSquared = dx * dx + dy * dy;
+            double t = lengthSquared > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / lengthSquared)) : 0;
+            shortest = Math.min(shortest, Math.hypot(ax + t * dx, ay + t * dy));
+            ax = bx;
+            ay = by;
+        }
+        return shortest;
     }
 
     public static class VerificationResult {

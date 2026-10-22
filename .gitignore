@@ -23,6 +23,9 @@ node_modules/
 dist/
 build/
 .tools/
+.runtime/
+backend/classes/
+backend/lib/
 application-local.yml
 .env
 .env.*

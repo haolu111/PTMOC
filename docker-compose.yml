@@ -1,0 +1,24 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    environment:
+      AMAP_WEB_KEY: ${AMAP_WEB_KEY:?Set AMAP_WEB_KEY in the project .env file}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--XX:MaxRAMPercentage=75.0}
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${PTMOC_BIND_ADDRESS:-127.0.0.1}:${PTMOC_PORT:-5173}:80"
+    restart: unless-stopped

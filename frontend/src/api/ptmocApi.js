@@ -1,6 +1,6 @@
 /**
  * PTMOC backend API client.
- * Prefers real /api/ptmoc/verify; callers should fall back to offline CRYPTO_DATA on failure.
+ * Uses /api/ptmoc/verify. Failed verification must not be replaced with a preset result.
  */
 
 const DEFAULT_BASE = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_PTMOC_API_BASE) || ''
@@ -56,14 +56,15 @@ export async function verifyTrajectory(payload, timeoutMs = 120000) {
         userTrajectory: normalizePoints(payload.userTrajectory),
         referenceTrajectory: normalizePoints(payload.referenceTrajectory),
         thresholdK: payload.thresholdK ?? 3,
+        onlineServerIds: payload.onlineServerIds ?? [1, 2, 3, 4, 5],
         timeAnomaly: !!payload.timeAnomaly,
         anomalyDesc: payload.anomalyDesc ?? null
       }),
       signal: controller.signal
     })
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new Error(`verify failed: ${res.status} ${text}`)
+      const error = await res.json().catch(() => ({}))
+      throw new Error(error.message || `验证请求失败 (${res.status})`)
     }
     return await res.json()
   } finally {
@@ -168,7 +169,7 @@ export function buildCryptoViewModel(response) {
   }
 
   return {
-    mode: 'online',
+    mode: hasError ? 'blocked' : 'online',
     key: `真实 PTMOC · k=${cr.thresholdK ?? response?.algorithmSummary?.thresholdK ?? '—'} · ${hasError ? 'crypto部分失败' : 'Encrypt/Eval/Decrypt OK'}`,
     steps,
     processTrace,

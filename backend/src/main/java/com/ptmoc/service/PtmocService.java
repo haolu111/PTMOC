@@ -27,6 +27,7 @@ public class PtmocService {
     }
 
     public VerifyResponse executeVerification(VerifyRequest request) {
+        List<Integer> selectedNodes = ThresholdPolicy.selectNodes(request);
         long totalStart = System.currentTimeMillis();
         List<Map<String, Object>> steps = new ArrayList<>();
         CryptoTraceBuilder trace = new CryptoTraceBuilder();
@@ -83,6 +84,7 @@ public class PtmocService {
             long d4 = System.currentTimeMillis() - t4;
             steps.add(buildStep(stepDefs[4], d4));
             trace.evaluate(functionDef, d4);
+            trace.logicalNodeResults(selectedNodes, evalResult);
 
             long t5 = System.currentTimeMillis();
             BigInteger decryptedResult = cryptoModule.decrypt("receiver_1", evalResult);
@@ -99,6 +101,8 @@ public class PtmocService {
             cr.put("functionDefinition", functionDef);
             cr.put("decryptedResult", decryptedResult.toString());
             cr.put("thresholdK", k);
+            cr.put("selectedNodeIds", selectedNodes);
+            cr.put("executionModel", "single-process-logical-nodes");
             cryptoResult = cr;
 
         } catch (Exception e) {
@@ -138,10 +142,14 @@ public class PtmocService {
         Map<String, Object> summary = new LinkedHashMap<>();
         summary.put("securityParameter", 256);
         summary.put("thresholdK", k);
+        summary.put("serverCount", ThresholdPolicy.SERVER_COUNT);
+        summary.put("onlineServerIds", request.getOnlineServerIds());
+        summary.put("selectedNodeIds", selectedNodes);
+        summary.put("executionModel", "single-process-logical-nodes");
         summary.put("polynomialDegree", 2);
         summary.put("rsaKeySize", 2048);
         summary.put("totalSteps", steps.size());
-        summary.put("encryptionType", "PTMOC (Privacy-Preserving Threshold Multi-Owner Cryptography)");
+        summary.put("encryptionType", "PTMOC (Privacy-Preserving Threshold Multi-key Multi-server Outsourced Computation)");
         summary.put("dataPoints", request.getUserTrajectory().size());
         summary.put("processTraceEvents", trace.getEvents().size());
         response.setAlgorithmSummary(summary);

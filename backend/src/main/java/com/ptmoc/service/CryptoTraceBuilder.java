@@ -102,6 +102,23 @@ public class CryptoTraceBuilder {
                 "Server + CSP 产出加密函数结果，交给 Receiver 解密", joint);
     }
 
+    public void logicalNodeResults(List<Integer> selectedNodes, Map<String, BigInteger> result) {
+        for (int i = 0; i < selectedNodes.size(); i++) {
+            int share = i + 1;
+            if (!result.containsKey("C_F_" + share) || !result.containsKey("C_ser_rec_" + share)
+                    || !result.containsKey("C_csp_rec_" + share)) {
+                throw new IllegalStateException("Missing partial result for logical node " + selectedNodes.get(i));
+            }
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("nodeId", selectedNodes.get(i));
+            data.put("shareIndex", share);
+            data.put("executionModel", "single-process-logical-nodes");
+            data.put("result", "Encrypted Partial Result");
+            add("EVAL", "SERVER", "RECEIVER", "逻辑节点 Ser " + selectedNodes.get(i) + " / CSP " + selectedNodes.get(i) + " 返回部分结果",
+                    "本机求值器已生成第 " + share + " 份部分结果；映射到演示协作组，不代表独立主机远程执行。", data);
+        }
+    }
+
     public void decrypt(String decryptedResult, long durationMs) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("decryptedResult", decryptedResult == null ? "" : decryptedResult);
@@ -153,7 +170,7 @@ public class CryptoTraceBuilder {
     }
 
     private static String toBadge(String status, List<String> reasonCodes) {
-        if (status != null && status.contains("通过") && (reasonCodes == null || reasonCodes.isEmpty())) {
+        if ("通过".equals(status) && (reasonCodes == null || reasonCodes.isEmpty())) {
             return "PASS";
         }
         if (reasonCodes != null) {

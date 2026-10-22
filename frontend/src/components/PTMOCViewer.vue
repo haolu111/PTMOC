@@ -4,8 +4,8 @@
     <div class="page page-login" v-if="currentPage === 'login'">
       <div class="login-card">
         <div class="login-header">
-          <h1>黑暗守卫者：基于车辆雾计算高效隐私保护轨迹验证demo</h1>
-          <p>Privacy-Preserving Trajectory Verification via Vehicular Fog Computing</p>
+          <h1>SecTravel</h1>
+          <p>{{ SYSTEM_NAME.replace('SecTravel：', '') }}</p>
         </div>
         <div class="login-body" v-if="loginMode === 'login'">
           <div class="form-group">
@@ -44,8 +44,8 @@
     <!-- ========== 主页：选择路线 ========== -->
     <div class="page page-main" v-if="currentPage === 'main'">
       <header class="app-header">
-        <h1>黑暗守卫者：基于车辆雾计算高效隐私保护轨迹验证demo</h1>
-        <span class="subtitle">Privacy-Preserving Trajectory Verification via Vehicular Fog Computing</span>
+        <h1>SecTravel</h1>
+        <span class="subtitle">{{ SYSTEM_NAME.replace('SecTravel：', '') }}</span>
         <div class="header-right">
           <span class="user-info">{{ currentUser }}</span>
           <button class="logout-btn" @click="handleLogout">退出</button>
@@ -64,15 +64,6 @@
             label="终点"
             placeholder="搜索终点，例如：上海虹桥站"
           />
-          <div class="form-row">
-            <label>阈值 k</label>
-            <select v-model.number="thresholdK">
-              <option :value="2">2</option>
-              <option :value="3">3</option>
-              <option :value="4">4</option>
-              <option :value="5">5</option>
-            </select>
-          </div>
           <button class="plan-btn" :disabled="isTraveling || planningLoading" @click="onPlanRoute">
             {{ planningLoading ? '规划中...' : '规划路线' }}
           </button>
@@ -110,7 +101,9 @@
           </div>
           <div class="map-container" ref="mapRef"></div>
         </div>
-        <aside class="route-side" v-if="plannedRoutes.length || planningLoading">
+        <aside class="route-side">
+          <ThresholdNodePanel v-model:online-ids="onlineServerIds" v-model:threshold-k="thresholdK" configurable :locked="preparingTravel" />
+          <div class="business-policy">异常监测策略：偏离路线 &gt; {{ SPATIAL_ALERT_THRESHOLD_METERS }} 米，或连续停留 &gt; {{ STOP_THRESHOLD_MINUTES }} 分钟 → 告警并停止演示行程。</div>
           <div v-if="planningLoading" class="route-loading">正在规划三条可选路线...</div>
           <RoutePlanList
             :routes="plannedRoutes"
@@ -124,7 +117,7 @@
     <!-- ========== 行程页：地图动画 + 右侧面板 ========== -->
     <div class="page page-travel" v-if="currentPage === 'travel'">
       <header class="app-header travel-header">
-        <h1>黑暗守卫者：行程验证</h1>
+        <h1>SecTravel · 行程验证</h1>
         <span class="subtitle">{{ currentTrajectory?.start }} → {{ currentTrajectory?.end }}</span>
         <span class="category-tag" :class="'cat-' + currentTrajectory?.category" v-if="currentTrajectory">
           {{ currentTrajectory?.label }}
@@ -146,12 +139,11 @@
               <span class="legend-line legend-alt"></span>绕路预览
             </span>
           </div>
-          <div class="spatial-notice" v-if="spatialNotice" role="alert">
+          <div class="spatial-notice" v-if="travelStopInfo" role="alert">
             <span>
-              <strong>路线偏移提醒</strong>
-              已检测到偏离参考路线
+              <strong>{{ travelStopInfo.type === 'quorum' ? '协作中断 · 行程已停止' : '异常告警 · 行程已停止' }}</strong>
+              {{ travelStopInfo.message }}
             </span>
-            <button type="button" aria-label="关闭路线偏移提醒" @click="spatialNotice = null">×</button>
           </div>
           <div class="map-container" ref="travelMapRef"></div>
         </div>
@@ -162,7 +154,13 @@
             <div class="timer-label">行程计时 (模拟)</div>
             <div class="timer-display">{{ formatTimer(travelTimer) }}</div>
             <div class="timer-hint">1秒 = 1分钟</div>
+            <div class="travel-state">{{ travelStopInfo ? '已停止 · 位置与计时已冻结' : isTraveling ? '监测中' : '行程已完成' }}</div>
+            <div v-if="stopDurationMinutes > 0" class="timer-hint">连续停留 {{ stopDurationMinutes.toFixed(2) }} / {{ STOP_THRESHOLD_MINUTES }} 分钟</div>
           </div>
+
+          <ThresholdNodePanel v-model:online-ids="onlineServerIds" :threshold-k="thresholdK" :locked="cryptoMode === 'loading'" />
+          <div class="business-policy">业务阈值：路线偏离 {{ SPATIAL_ALERT_THRESHOLD_METERS }} 米 / 连续停留 {{ STOP_THRESHOLD_MINUTES }} 分钟。超限后停止行程，确认弹窗不会恢复行驶。</div>
+          <button v-if="travelStopInfo?.type === 'quorum' && quorum.ready && cryptoMode !== 'loading'" class="plan-btn" @click="retryStoppedVerification">节点已恢复，重新验证已采集轨迹</button>
 
           <!-- PTMOC 密码数据流可视化（由 processTrace 驱动） -->
           <div class="crypto-section" v-if="showCryptoProcess">
@@ -258,17 +256,19 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { ROUTE_COORDS } from '../data/trajectoryData.js'
 import { buildScenarioTrajectory, scenarioOptions } from '../data/trajectoryScenario.js'
-import { buildTraveledTrajectory, distanceToRouteMeters, SPATIAL_ALERT_THRESHOLD_METERS } from '../utils/routeDeviation.js'
+import { buildTraveledTrajectory, SPATIAL_ALERT_THRESHOLD_METERS } from '../utils/routeDeviation.js'
+import { SYSTEM_NAME, DEFAULT_THRESHOLD_K, STOP_THRESHOLD_MINUTES, getQuorum, detectTravelAlert } from '../utils/demoPolicy.js'
 import { verifyTrajectory, buildCryptoViewModel, buildSyntheticProcessTrace } from '../api/ptmocApi.js'
 import { emptyLocation, isLocationSelected, planRoutes, planDetourRoute } from '../api/mapApi.js'
 import LocationSelector from './map/LocationSelector.vue'
 import RoutePlanList from './map/RoutePlanList.vue'
 import CryptoFlowPanel from './crypto/CryptoFlowPanel.vue'
+import ThresholdNodePanel from './crypto/ThresholdNodePanel.vue'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -514,7 +514,9 @@ function handleLogout() {
 }
 
 // ========== 主页状态 ==========
-const thresholdK = ref(3)
+const thresholdK = ref(DEFAULT_THRESHOLD_K)
+const onlineServerIds = ref([1, 2, 3, 4, 5])
+const quorum = computed(() => getQuorum(onlineServerIds.value, thresholdK.value))
 const currentTrajectory = ref(null)
 const isTraveling = ref(false)
 
@@ -532,6 +534,7 @@ const preparingTravel = ref(false)
 
 const canStart = computed(() => {
   if (isTraveling.value || preparingTravel.value) return false
+  if (!quorum.value.ready) return false
   return !!(selectedPlannedRoute.value && (selectedPlannedRoute.value.polyline || []).length >= 2)
 })
 
@@ -731,7 +734,7 @@ function updateMainMap() {
 
 function initMainMap() {
   if (mapRef.value && !mainMap) {
-    mainMap = L.map(mapRef.value, { attributionControl: false, zoomControl: true }).setView([31.23, 121.47], 12)
+    mainMap = L.map(mapRef.value, { attributionControl: false, zoomControl: true, zoomAnimation: false, fadeAnimation: false }).setView([31.23, 121.47], 12)
     L.tileLayer(TILE_URL, { maxZoom: 18, subdomains: TILE_SUBDOMAINS }).addTo(mainMap)
     setTimeout(() => {
       if (mainMap) {
@@ -746,7 +749,10 @@ function initMainMap() {
 
 // ========== 行程页状态 ==========
 const travelTimer = ref(0) // 模拟分钟数（1真实秒=1模拟分钟）
-const spatialNotice = ref(null)
+const travelStopInfo = ref(null)
+const stopDurationMinutes = ref(0)
+let stoppedTrajectory = null
+let latestTravelPosition = null
 const showCryptoProcess = ref(false)
 const cryptoSteps = ref([])
 const cryptoProcessTrace = ref([])
@@ -896,11 +902,27 @@ function showAlert(type, message) {
 
 function dismissAlert() {
   alertInfo.value.show = false
-  // 弹窗关闭后显示PTMOC验证过程
-  if (!showCryptoProcess.value) {
-    showCryptoProcess.value = true
-    animateCryptoProcess()
-  }
+}
+
+function clearTravelTimers() {
+  if (pathAnimTimeout != null) { cancelAnimationFrame(pathAnimTimeout); pathAnimTimeout = null }
+  if (travelTimerInterval != null) { clearInterval(travelTimerInterval); travelTimerInterval = null }
+}
+
+function haltTravel(info, trajectory) {
+  if (travelAlertFired) return
+  travelAlertFired = true
+  clearTravelTimers()
+  isTraveling.value = false
+  travelStopInfo.value = info
+  stoppedTrajectory = trajectory
+  showAlert('warning', info.message)
+  showCryptoProcess.value = true
+  void animateCryptoProcess(trajectory)
+}
+
+function retryStoppedVerification() {
+  if (stoppedTrajectory && quorum.value.ready) void animateCryptoProcess(stoppedTrajectory)
 }
 
 function formatTimer(minutes) {
@@ -987,7 +1009,10 @@ async function startTravel() {
   isTraveling.value = true
   currentPage.value = 'travel'
   travelTimer.value = 0
-  spatialNotice.value = null
+  travelStopInfo.value = null
+  stopDurationMinutes.value = 0
+  stoppedTrajectory = null
+  latestTravelPosition = null
   showCryptoProcess.value = false
   cryptoSteps.value = []
   cryptoProcessTrace.value = []
@@ -1011,7 +1036,7 @@ async function startTravel() {
 
 function initTravelMap() {
   if (travelMapRef.value && !travelMap) {
-    travelMap = L.map(travelMapRef.value, { attributionControl: false, zoomControl: true }).setView([31.23, 121.47], 12)
+    travelMap = L.map(travelMapRef.value, { attributionControl: false, zoomControl: true, zoomAnimation: false, fadeAnimation: false }).setView([31.23, 121.47], 12)
     L.tileLayer(TILE_URL, { maxZoom: 18, subdomains: TILE_SUBDOMAINS }).addTo(travelMap)
   }
 
@@ -1068,7 +1093,6 @@ function startPathAnimation() {
   // 动画始终跟随「用户轨迹」（场景生成器已写入正常/偏移路径）
   const displayPts = convertPts(currentTrajectory.value.userTrajectory, coordSystem)
   const referencePts = convertPts(currentTrajectory.value.referenceTrajectory, coordSystem)
-  let spatialAlertShown = false
 
   const totalDisplayPoints = displayPts.length
 
@@ -1100,9 +1124,8 @@ function startPathAnimation() {
   }, 1000)
 
   let animStartTime = null
-  let animPausedAt = null
   let timeAnomalyPaused = false
-  let timeAnomalyResumeTime = null
+  let timeAnomalyPauseStarted = null
   let animFinished = false
 
   function getPositionAtDist(dist) {
@@ -1147,18 +1170,27 @@ function startPathAnimation() {
     if (!animStartTime) animStartTime = timestamp
 
     if (timeAnomalyPaused) {
-      if (timestamp >= timeAnomalyResumeTime) {
-        timeAnomalyPaused = false
-        animStartTime = timestamp - (animPausedAt / speed)
-      } else {
-        pathAnimTimeout = requestAnimationFrame(animFrame)
+      stopDurationMinutes.value = (timestamp - timeAnomalyPauseStarted) / 1000
+      const alert = detectTravelAlert(latestTravelPosition, referencePts, stopDurationMinutes.value)
+      if (alert) {
+        const observed = buildTraveledTrajectory(currentTrajectory.value, latestTravelPosition.segIdx, latestTravelPosition.fraction)
+        // Only add the stop already observed, rather than the future scenario timestamps.
+        observed.userTrajectory = observed.referenceTrajectory.map(p => ({ ...p }))
+        const last = observed.userTrajectory.at(-1)
+        observed.userTrajectory.push({ ...last, timestamp: Math.round(last.timestamp + stopDurationMinutes.value * 60000) })
+        observed.referenceTrajectory.push({ ...observed.referenceTrajectory.at(-1) })
+        observed.anomalyDesc = alert.message
+        haltTravel(alert, observed)
         return
       }
+      pathAnimTimeout = requestAnimationFrame(animFrame)
+      return
     }
 
     const elapsed = timestamp - animStartTime
     const currentDist = Math.min(speed * elapsed, totalDist)
     const pos = getPositionAtDist(currentDist)
+    latestTravelPosition = pos
 
     if (carMarker) {
       carMarker.setLatLng([pos.lat, pos.lng])
@@ -1176,49 +1208,26 @@ function startPathAnimation() {
 
     if (category === 'time' && timeAnomalyStopDist > 0 && currentDist >= timeAnomalyStopDist && !timeAnomalyPaused) {
       timeAnomalyPaused = true
-      animPausedAt = currentDist
-      setTimeout(() => {
-        animFinished = true
-        travelAlertFired = true
-        clearInterval(travelTimerInterval)
-        travelTimerInterval = null
-        isTraveling.value = false
-        showAlert('warning', '时间异常！停留时间过久，已触发PTMOC验证。')
-      }, 5000)
+      timeAnomalyPauseStarted = timestamp
+      pathAnimTimeout = requestAnimationFrame(animFrame)
       return
     }
 
-    if (category === 'spatial') {
-      if (!spatialAlertShown && referencePts.length >= 2) {
-        const deviationMeters = distanceToRouteMeters(pos, referencePts)
-        if (deviationMeters > SPATIAL_ALERT_THRESHOLD_METERS) {
-          spatialAlertShown = true
-          spatialNotice.value = { distanceMeters: Math.round(deviationMeters) }
-          const traveled = buildTraveledTrajectory(currentTrajectory.value, pos.segIdx, pos.fraction)
-          showCryptoProcess.value = true
-          // 异步验证截至告警时刻的轨迹，不等待结果、不暂停动画。
-          void animateCryptoProcess(traveled)
-        }
-      }
-
-      if (currentDist >= totalDist) {
-        animFinished = true
-        clearInterval(travelTimerInterval)
-        travelTimerInterval = null
-        isTraveling.value = false
-        // 已在超阈值时触发验证，终点只结束行程。
-        return
-      }
+    const alert = detectTravelAlert(pos, referencePts)
+    if (alert) {
+      const traveled = buildTraveledTrajectory(currentTrajectory.value, pos.segIdx, pos.fraction)
+      traveled.anomalyDesc = alert.message
+      haltTravel(alert, traveled)
+      return
     }
 
-    if (category === 'pass' && currentDist >= totalDist) {
+    if (currentDist >= totalDist) {
       animFinished = true
-      clearInterval(travelTimerInterval)
-      travelTimerInterval = null
+      clearTravelTimers()
       isTraveling.value = false
-      setTimeout(() => {
-        showAlert('success', '您的行程受PTMOC隐私加密算法验证，全程时空无偏移。')
-      }, 1500)
+      showCryptoProcess.value = true
+      showAlert('success', 'SecTravel：行程已完成，未触发业务异常阈值。正在验证已采集轨迹。')
+      void animateCryptoProcess()
       return
     }
 
@@ -1294,8 +1303,18 @@ function buildOfflineViewModel(traj = currentTrajectory.value) {
 
 async function animateCryptoProcess(traj = currentTrajectory.value) {
   const sourceTrajectory = currentTrajectory.value
+  if (!quorum.value.ready) {
+    cryptoMode.value = 'blocked'
+    cryptoKey.value = `在线 ${quorum.value.online.length} / 5，不足门限 k=${thresholdK.value}，未执行验证、未恢复结果。`
+    cryptoProcessTrace.value = []
+    cryptoResult.value = null
+    return
+  }
   if (!traj) {
-    playCryptoViewModel(buildOfflineViewModel())
+    cryptoMode.value = 'blocked'
+    cryptoKey.value = '没有已采集轨迹，未执行验证或恢复结果。'
+    cryptoProcessTrace.value = []
+    cryptoResult.value = null
     return
   }
 
@@ -1314,6 +1333,7 @@ async function animateCryptoProcess(traj = currentTrajectory.value) {
       userTrajectory: traj.userTrajectory,
       referenceTrajectory: traj.referenceTrajectory,
       thresholdK: thresholdK.value,
+      onlineServerIds: [...onlineServerIds.value],
       timeAnomaly: !!traj.timeAnomaly,
       anomalyDesc: traj.anomalyDesc || null
     })
@@ -1321,10 +1341,10 @@ async function animateCryptoProcess(traj = currentTrajectory.value) {
     playCryptoViewModel(buildCryptoViewModel(response))
   } catch (err) {
     if (currentTrajectory.value !== sourceTrajectory) return
-    console.warn('[PTMOC] backend unavailable, using offline CRYPTO_DATA:', err)
-    const offline = buildOfflineViewModel(traj)
-    offline.key = `离线兜底（后端不可用: ${err?.message || err}）`
-    playCryptoViewModel(offline)
+    cryptoMode.value = 'blocked'
+    cryptoKey.value = `验证未完成：${err?.message || err}。没有恢复结果。`
+    cryptoProcessTrace.value = []
+    cryptoResult.value = null
   }
 }
 
@@ -1339,6 +1359,15 @@ function goBackToMain() {
   currentPage.value = 'main'
   // watcher + initMainMap 会处理地图重建和轨迹绘制
 }
+
+watch(() => quorum.value.ready, ready => {
+  if (ready || !isTraveling.value || !latestTravelPosition) return
+  const pos = latestTravelPosition
+  haltTravel({ type: 'quorum', message: `在线节点不足门限 k=${thresholdK.value}，行程与计时已停止；恢复节点后可重新验证。` },
+    buildTraveledTrajectory(currentTrajectory.value, pos.segIdx, pos.fraction))
+})
+
+onBeforeUnmount(clearTravelTimers)
 
 // ========== 初始化 ==========
 onMounted(() => {
@@ -1440,7 +1469,7 @@ watch(currentPage, (val) => {
   flex-shrink: 0;
 }
 .app-header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-.subtitle { font-size: 11px; opacity: 0.7; font-family: monospace; }
+.subtitle { font-size: 11px; opacity: 0.7; line-height: 1.6; }
 .header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .user-info { font-size: 13px; opacity: 0.9; }
 .logout-btn {
@@ -1527,7 +1556,7 @@ watch(currentPage, (val) => {
   margin: 0;
 }
 .route-side {
-  width: 300px;
+  width: 355px;
   flex-shrink: 0;
   overflow-y: auto;
   padding: 4px 2px;
@@ -1681,6 +1710,8 @@ watch(currentPage, (val) => {
 .timer-label { font-size: 12px; opacity: 0.7; margin-bottom: 4px; }
 .timer-display { font-size: 36px; font-weight: 700; font-family: monospace; letter-spacing: 2px; }
 .timer-hint { font-size: 10px; opacity: 0.5; margin-top: 4px; }
+.travel-state { font-size: 13px; margin-top: 10px; color: #ffdc96; }
+.business-policy { padding: 12px 4px; font-size: 12px; color: #6c562f; line-height: 1.7; }
 
 /* PTMOC 密码流程：样式由 CryptoFlowPanel 自带 */
 .crypto-section {

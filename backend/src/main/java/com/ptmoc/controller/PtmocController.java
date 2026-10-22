@@ -4,6 +4,7 @@ import com.ptmoc.dto.VerifyRequest;
 import com.ptmoc.dto.VerifyResponse;
 import com.ptmoc.service.PtmocService;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
@@ -24,11 +25,16 @@ public class PtmocController {
         return ResponseEntity.ok(response);
     }
 
+    @ExceptionHandler(ResponseStatusException.class)
+    public ResponseEntity<Map<String, String>> invalidVerification(ResponseStatusException error) {
+        return ResponseEntity.status(error.getStatusCode()).body(Map.of("message", error.getReason() == null ? "验证请求无效" : error.getReason()));
+    }
+
     @GetMapping("/health")
     public ResponseEntity<Map<String, Object>> health() {
         return ResponseEntity.ok(Map.of(
             "status", "UP",
-            "service", "PTMOC Backend",
+            "service", "SecTravel Backend",
             "version", "1.0.0"
         ));
     }

@@ -444,10 +444,10 @@ public class AmapService {
             return httpGetJava(urlStr);
         } catch (javax.net.ssl.SSLException sslEx) {
             System.err.println("[Amap] Java HTTPS failed (" + sslEx.getMessage() + "), fallback to curl");
-            return httpGetCurl(urlStr);
+            return httpGetCurl(urlStr, sslEx);
         } catch (java.net.SocketException se) {
             System.err.println("[Amap] Java socket failed (" + se.getMessage() + "), fallback to curl");
-            return httpGetCurl(urlStr);
+            return httpGetCurl(urlStr, se);
         }
     }
 
@@ -473,7 +473,7 @@ public class AmapService {
         }
     }
 
-    private static String httpGetCurl(String urlStr) throws Exception {
+    private static String httpGetCurl(String urlStr, Exception javaFailure) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "curl", "--noproxy", "*", "-sS", "-f",
                 "--connect-timeout", "5",
@@ -491,10 +491,14 @@ public class AmapService {
         }
         int code = p.waitFor();
         if (code != 0) {
+            String reason = javaFailure.getMessage() == null ? "" : javaFailure.getMessage();
+            String message = reason.contains("Permission denied")
+                    ? "地图后端进程没有外网访问权限，请允许后端访问高德 HTTPS 服务后重新启动。"
+                    : "地图服务连接失败，请检查服务器到高德的网络连接。";
             throw new IllegalStateException(
-                    "地图服务 HTTPS 握手失败（Java SSL + curl 均不可用）。"
-                            + "请检查网络/代理；若开了 Clash 等代理，可尝试关闭系统 HTTPS 代理或换网络。详情: "
-                            + sb);
+                    message + "详情: Java " + javaFailure.getClass().getSimpleName()
+                            + ": " + reason + "; curl (" + code + "): " + sb,
+                    javaFailure);
         }
         return sb.toString();
     }

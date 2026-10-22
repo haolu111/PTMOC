@@ -167,7 +167,7 @@ public class CryptoModule {
                 BigInteger encRPrime = ciphertexts.get("C_csp_rec_" + l);
 
                 if (partialCipher == null || encR == null || encRPrime == null) {
-                    continue;
+                    throw new IllegalStateException("Missing threshold contribution " + l + "; result recovery is forbidden");
                 }
 
                 BigInteger r = CryptoUtil.trapdoorDecryptBigInteger(receiverKeyPair.getPrivateKey(), encR);

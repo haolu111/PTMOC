@@ -2,11 +2,13 @@
   <div class="cfp">
     <div class="cfp-head">
       <div>
-        <h4>PTMOC 怎么跑</h4>
-        <p class="cfp-tagline">不传原始轨迹，只在密文上算「偏没偏」</p>
+        <h4>SecTravel · PTMOC 验证流程</h4>
+        <p class="cfp-tagline">参数与密钥 → 加密 → 门限协作 → 结果恢复</p>
       </div>
       <span class="cfp-mode" :class="mode">{{ modeLabel }}</span>
     </div>
+    <p v-if="summary" class="cfp-summary" :role="mode === 'blocked' ? 'alert' : 'status'">{{ summary }}</p>
+    <p v-if="mode === 'blocked'" class="cfp-blocked">验证未完成，未恢复 Mat；本次没有有效验证结论。</p>
 
     <!-- 一句话总览：评委第一眼就能抓住主线 -->
     <div class="cfp-story">
@@ -93,7 +95,7 @@
     <div class="cfp-result" v-if="resultBadge">
       <div class="cfp-result-badge" :class="resultTone">{{ resultBadge }}</div>
       <div class="cfp-result-meta" v-if="resultMeta">{{ resultMeta }}</div>
-      <div class="cfp-privacy">✓ 原始 GPS 轨迹从未发给 Server / CSP，只交出「偏没偏」的答案</div>
+      <div class="cfp-privacy">单机原型重放：逻辑节点在同一后端执行，当前 API 同时接收轨迹做诊断。</div>
     </div>
 
     <div class="cfp-time" v-if="totalDuration != null && totalDuration !== ''">
@@ -170,12 +172,13 @@ const plainCopy = {
   },
   RESULT: {
     title: '输出最终判定',
-    desc: '根据解密值与门限，给出通过 / 时空异常等结论，并附综合评分。'
+    desc: '密码学门限 k 控制协作与恢复；业务异常阈值控制轨迹告警。两者分别判定。'
   }
 }
 
 const modeLabel = computed(() => {
   if (props.mode === 'online') return '真实后端重放'
+  if (props.mode === 'blocked') return '已阻止 / 未完成'
   if (props.mode === 'loading') return '调用后端中'
   return '离线演示'
 })
@@ -207,12 +210,14 @@ const stagePlainLabel = computed(() => stagePlain[currentStage.value] || current
 const plainTitle = computed(() => {
   const stage = currentStage.value
   const fallback = currentEvent.value?.title || ''
+  if (currentEvent.value?.displayData?.nodeId) return fallback
   return plainCopy[stage]?.title || fallback
 })
 
 const plainDesc = computed(() => {
   const stage = currentStage.value
   const ev = currentEvent.value
+  if (ev?.displayData?.nodeId) return ev.description || ''
   // Encode 时若有具体 x 值，补一句更直观
   if (stage === 'ENCODE' && ev?.displayData) {
     const d = ev.displayData
@@ -244,7 +249,7 @@ const privacyLine = computed(() => {
   if (stage === 'ENCODE') return '明文仅在车辆'
   if (stage === 'ENCRYPT') return '发出去的都是密文'
   if (stage === 'EVAL') return 'Server/CSP 不见轨迹'
-  if (stage === 'DECRYPT' || stage === 'RESULT') return '只恢复验证值'
+  if (stage === 'DECRYPT' || stage === 'RESULT') return '原型函数求值与轨迹诊断'
   return ''
 })
 
@@ -302,7 +307,7 @@ watch(
   () => [props.processTrace, props.mode, props.autoPlay],
   () => {
     resetPlayback()
-    if (props.mode === 'loading') return
+    if (props.mode === 'loading' || props.mode === 'blocked') return
     if (props.autoPlay && props.processTrace?.length) {
       startPlayback()
     }
@@ -412,7 +417,7 @@ function applyEvent(ev) {
     const score = ev.displayData?.score
     const status = ev.displayData?.verificationStatus
     resultMeta.value = [status, score != null ? `评分 ${score}` : null].filter(Boolean).join(' · ')
-    resultTone.value = String(badge).includes('PASS') || String(status || '').includes('通过') ? 'pass' : 'fail'
+    resultTone.value = String(badge) === 'PASS' || String(status) === '通过' ? 'pass' : 'fail'
     const done = new Set(completedStages.value)
     done.add('RESULT')
     completedStages.value = done
@@ -504,6 +509,8 @@ function animatePacket(fromId, toId, label) {
 </script>
 
 <style scoped>
+.cfp-summary { font-size: 12px; line-height: 1.6; color: #4c6177; overflow-wrap: anywhere; margin: 10px 0; }
+.cfp-blocked { padding: 10px; background: #fff1f0; color: #ac3030; border-radius: 6px; font-size: 13px; line-height: 1.6; }
 .cfp {
   background: #f7f9fc;
   border: 1px solid #e8eef5;

@@ -3,7 +3,7 @@
  * 空间异常必须使用「真实道路绕路」（备选规划路线 / 途经点绕路），禁止法向平移假路径。
  */
 
-import { distanceToRouteMeters } from '../utils/routeDeviation.js'
+import { distanceToRouteMeters, SPATIAL_ALERT_THRESHOLD_METERS } from '../utils/routeDeviation.js'
 
 const SCENARIO_META = {
   pass: { category: 'pass', label: '准确无误', timeAnomaly: false },
@@ -12,7 +12,7 @@ const SCENARIO_META = {
 }
 
 /** 认定「明显绕路」的最小最大偏离（米） */
-export const MIN_DETOUR_MAX_DEV_METERS = 180
+export const MIN_DETOUR_MAX_DEV_METERS = SPATIAL_ALERT_THRESHOLD_METERS + 20
 
 /**
  * @param {object} opts
